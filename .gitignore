@@ -1,0 +1,51 @@
+# Dependencies & builds
+node_modules/
+dist/
+dist-ssr/
+*.local
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+
+# Envs & secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+ENV/
+
+# ML / large artifacts (keep training outputs local)
+*.pt
+*.pth
+*.onnx
+*.weights
+runs/
+wandb/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# App runtime data (regenerate locally)
+vestir-prototype/server/storage/processed/**
+!vestir-prototype/server/storage/processed/.gitkeep
+vestir-prototype/server/storage/embeddings.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+*.swp
+*.suo

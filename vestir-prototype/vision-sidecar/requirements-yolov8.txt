@@ -1,0 +1,4 @@
+# Optional: YOLOv8 (Ultralytics). Heavy (pulls PyTorch). Use when VESTIR_YOLOV8_PT is set.
+# pip install -r requirements-yolov8.txt
+
+ultralytics>=8.0.0
