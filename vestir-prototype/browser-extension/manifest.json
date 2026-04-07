@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Vestir Closet Matcher",
+  "version": "0.1.0",
+  "description": "Match clothing from shopping sites to your Vestir closet.",
+  "permissions": ["activeTab", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

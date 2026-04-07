@@ -11,7 +11,7 @@ export function EmptyState({ title, description, action }: EmptyStateProps) {
     <div className="card empty">
       <h3>{title}</h3>
       {description ? <p className="muted">{description}</p> : null}
-      {action}
+      {action ? <div className="empty-action">{action}</div> : null}
     </div>
   )
 }

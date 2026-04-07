@@ -62,13 +62,26 @@ def run_yolov8(image_bgr: np.ndarray) -> dict[str, Any] | None:
     except ImportError:
         return None
 
-    conf = float(os.environ.get("VESTIR_YOLOV8_CONF", "0.4"))
+    conf = float(os.environ.get("VESTIR_YOLOV8_CONF", "0.3"))
+    iou = float(os.environ.get("VESTIR_YOLOV8_IOU", "0.6"))
+    max_det = int(os.environ.get("VESTIR_YOLOV8_MAX_DET", "30"))
+    imgsz_raw = os.environ.get("VESTIR_YOLOV8_IMGSZ", "").strip()
+    imgsz = int(imgsz_raw) if imgsz_raw else None
     img_h, img_w = image_bgr.shape[:2]
     if img_h < 2 or img_w < 2:
         return None
 
     try:
-        results = model.predict(source=image_bgr, conf=conf, verbose=False)
+        predict_kw: dict[str, Any] = {
+            "source": image_bgr,
+            "conf": conf,
+            "iou": iou,
+            "max_det": max_det,
+            "verbose": False,
+        }
+        if imgsz is not None:
+            predict_kw["imgsz"] = imgsz
+        results = model.predict(**predict_kw)
     except Exception:
         return None
 

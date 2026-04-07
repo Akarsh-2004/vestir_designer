@@ -17,6 +17,12 @@ const sizeClasses = {
 
 export function ItemPhoto({ itemId, imageUrl, alt, size = 'full', className }: ItemPhotoProps) {
   const src = imageUrl || ITEM_IMAGES[itemId]
-  if (!src) return <div className={`photo-fallback ${sizeClasses[size]} ${className ?? ''}`}>No photo</div>
+  if (!src) {
+    return (
+      <div className={`photo-fallback ${sizeClasses[size]} ${className ?? ''}`} role="img" aria-label={alt}>
+        Photo not available
+      </div>
+    )
+  }
   return <img src={src} alt={alt} className={`${sizeClasses[size]} ${className ?? ''}`} />
 }

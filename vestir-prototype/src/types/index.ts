@@ -19,6 +19,8 @@ export interface Item {
   color_primary_hsl: HSLColor
   color_secondary_hsl?: HSLColor
   material: string
+  /** Relaxed / slim / … when inference returns it */
+  fit?: string
   formality: number
   season: string[]
   ai_processed: boolean

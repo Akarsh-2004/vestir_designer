@@ -8,6 +8,11 @@ import { GoogleGenAI } from '@google/genai'
 import vision from '@google-cloud/vision'
 import { z } from 'zod'
 import dotenv from 'dotenv'
+import {
+  prepareColorAnalysisBuffer,
+  maskPolygonToPng,
+  detectImageMime,
+} from './lib/vestirColor.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -26,13 +31,32 @@ app.use(cors())
 app.use(express.json({ limit: '20mb' }))
 app.use('/storage', express.static(storageDir))
 
-const geminiApiKey = process.env.GEMINI_API_KEY
-const genai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null
+function getGeminiApiKey() {
+  const candidates = [
+    { env: 'GEMINI_API_KEY', value: process.env.GEMINI_API_KEY },
+    { env: 'gemini_apikey', value: process.env.gemini_apikey },
+    { env: 'GEMINI_APIKEY', value: process.env.GEMINI_APIKEY },
+    { env: 'GEMINI_KEY', value: process.env.GEMINI_KEY },
+  ]
+  const hit = candidates.find((c) => typeof c.value === 'string' && c.value.trim().length > 0)
+  return hit ? { apiKey: hit.value.trim(), source: hit.env } : { apiKey: undefined, source: undefined }
+}
+
+const geminiConfig = getGeminiApiKey()
+const genai = geminiConfig.apiKey ? new GoogleGenAI({ apiKey: geminiConfig.apiKey }) : null
+const geminiApiKeySource = geminiConfig.source
 const faceClient = process.env.GOOGLE_APPLICATION_CREDENTIALS ? new vision.ImageAnnotatorClient() : null
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434'
 const ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.2:3b'
 const embeddingModel = process.env.GEMINI_EMBEDDING_MODEL ?? 'gemini-embedding-001'
 const visionSidecarUrl = process.env.VISION_SIDECAR_URL ?? 'http://127.0.0.1:8008'
+const embeddingSidecarUrl = (process.env.EMBEDDING_SIDECAR_URL ?? '').trim()
+const inferFlashModel = process.env.VESTIR_INFER_FLASH_MODEL ?? 'gemini-2.5-flash'
+const inferProModel = process.env.VESTIR_INFER_PRO_MODEL ?? 'gemini-2.5-pro'
+const inferConsistencySamples = Math.min(
+  5,
+  Math.max(1, Number.parseInt(process.env.INFER_CONSISTENCY_SAMPLES ?? '1', 10) || 1),
+)
 const tryonSidecarUrl = process.env.TRYON_SIDECAR_URL ?? 'http://127.0.0.1:8009'
 const serpApiKey = process.env.SERPAPI_API_KEY ?? ''
 /** Public origin SerpApi can reach (e.g. https://xxxx.ngrok-free.app) so /storage/... and localhost URLs can be rewritten */
@@ -59,6 +83,7 @@ const OCCASION_ENUM = [
 const STYLE_ENUM = ['minimalist', 'preppy', 'techwear', 'classic', 'sporty', 'street', 'boho', 'smart_casual', 'maximalist']
 const LAYERING_ROLE_ENUM = ['base_layer', 'mid_layer', 'outer_layer', 'standalone']
 const SEASON_ENUM = ['spring', 'summer', 'autumn', 'winter']
+const FIT_ENUM = ['slim', 'regular', 'relaxed', 'oversized', 'unknown']
 
 const hslSchema = z.object({
   h: z.number().min(0).max(360),
@@ -93,6 +118,7 @@ const structuralSchema = z.object({
     primary: z.string().min(1),
     confidence: confidenceSchema,
   }),
+  fit: z.string().optional(),
 })
 
 const semanticSchema = z.object({
@@ -131,6 +157,7 @@ const inferSchema = z.object({
     is_neutral: z.boolean().optional(),
   })).min(1),
   pattern: z.enum(PATTERN_ENUM),
+  fit: z.string().optional(),
   material: z.string().min(1),
   material_confidence: confidenceSchema,
   formality: z.number().min(1).max(10),
@@ -153,10 +180,20 @@ const inferSchema = z.object({
   quality: qualitySchema,
 })
 
-const preprocessRequestSchema = z.object({ imageUrl: z.string().min(1) })
+const preprocessRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  /** Normalized 0–1 vertices; garment interior stays opaque in a PNG for downstream color. */
+  maskPolygon: z.array(z.object({ x: z.number(), y: z.number() })).min(3).optional(),
+})
 const inferRequestSchema = z.object({ processedImageUrl: z.string().min(1) })
 const embedRequestSchema = z.object({ item: z.any() })
 const reasonRequestSchema = z.object({ item: z.any() })
+const extensionMatchSchema = z.object({
+  imageUrl: z.string().min(1),
+  pageUrl: z.string().optional(),
+  title: z.string().optional(),
+  topK: z.number().int().min(1).max(20).optional(),
+})
 const tryonPreviewRequestSchema = z.object({
   personImageUrl: z.string().min(1),
   garmentImageUrl: z.string().min(1),
@@ -411,6 +448,32 @@ function dedupePalette(colors, limit = 3) {
     if (!duplicate) merged.push(color)
   }
   return merged
+}
+
+/**
+ * Prefer "fabric-like" light neutrals (e.g. white t-shirt base) over dark graphic regions.
+ * This matters a lot for garments with large prints/logos that can dominate simple dominant-color heuristics.
+ */
+function prioritizeLightNeutralsPrimary(colors, fallbackToCoverage = true) {
+  if (!Array.isArray(colors) || colors.length === 0) return colors
+  const candidates = colors.filter((c) => {
+    const hsl = c?.hsl
+    if (!hsl) return false
+    const l = Number(hsl.l ?? 0)
+    const s = Number(hsl.s ?? 1)
+    return l >= 0.78 && s <= 0.25
+  })
+  if (!candidates.length) return colors
+
+  // Pick the lightest neutral.
+  candidates.sort((a, b) => Number((b.hsl?.l ?? 0) - (a.hsl?.l ?? 0)))
+  const primary = candidates[0]
+
+  const rest = colors
+    .filter((c) => c !== primary)
+    .sort((a, b) => (fallbackToCoverage ? Number((b.coverage_pct ?? 0) - (a.coverage_pct ?? 0)) : 0))
+
+  return [primary, ...rest]
 }
 
 function paletteHueSpread(colors) {
@@ -711,8 +774,10 @@ function labDistance(p, q) {
  */
 async function extractLabKMeansPalette(imageBuffer, k = 4) {
   try {
+    const meta = await sharp(imageBuffer).metadata()
+    const hasAlpha = Boolean(meta.hasAlpha)
     const { data, info } = await sharp(imageBuffer)
-      .removeAlpha()
+      .ensureAlpha()
       .resize(112, 112, { fit: 'inside' })
       .raw()
       .toBuffer({ resolveWithObject: true })
@@ -723,6 +788,7 @@ async function extractLabKMeansPalette(imageBuffer, k = 4) {
     for (let y = 0; y < height; y += 2) {
       for (let x = 0; x < width; x += 2) {
         const idx = (y * width + x) * channels
+        if (hasAlpha && channels >= 4 && data[idx + 3] < 90) continue
         const r = data[idx]
         const g = data[idx + 1]
         const bl = data[idx + 2]
@@ -1046,15 +1112,20 @@ function extractJsonObject(text) {
   return trimmed.slice(firstBrace, lastBrace + 1)
 }
 
-async function runGeminiJson(model, schema, prompt, base64Image) {
+async function runGeminiJson(model, schema, prompt, base64Image, options = {}) {
+  const {
+    mimeType = 'image/jpeg',
+    temperature = 0.35,
+    responseMimeType = 'application/json',
+  } = options
   const result = await genai.models.generateContent({
     model,
-    config: { responseMimeType: 'application/json' },
+    config: { responseMimeType, temperature },
     contents: [
       { text: prompt },
       {
         inlineData: {
-          mimeType: 'image/jpeg',
+          mimeType,
           data: base64Image,
         },
       },
@@ -1063,6 +1134,37 @@ async function runGeminiJson(model, schema, prompt, base64Image) {
   const text = result.text ?? ''
   const payload = extractJsonObject(text)
   return schema.parse(JSON.parse(payload))
+}
+
+function majorityPick(samples, keyFn) {
+  const counts = new Map()
+  for (const s of samples) {
+    const k = keyFn(s)
+    counts.set(k, (counts.get(k) ?? 0) + 1)
+  }
+  let best = null
+  let bestN = 0
+  for (const [k, n] of counts) {
+    if (n > bestN) {
+      bestN = n
+      best = k
+    }
+  }
+  return { value: best, count: bestN, total: samples.length }
+}
+
+function pickStructuralByCategoryVote(samples) {
+  const { value: cat } = majorityPick(samples, (s) => s.category)
+  const match = samples.filter((s) => s.category === cat)
+  return match[0] ?? samples[0]
+}
+
+function inferNeedsProTiebreaker(samples) {
+  if (samples.length < 2) return false
+  const need = Math.ceil(samples.length / 2)
+  const { count: catCount } = majorityPick(samples, (s) => s.category)
+  const { count: patCount } = majorityPick(samples, (s) => s.pattern)
+  return catCount < need || patCount < need
 }
 
 function buildDeterministicFallbackVector(payload, dims = 256) {
@@ -1074,6 +1176,72 @@ function buildDeterministicFallbackVector(payload, dims = 256) {
     vector.push((x / 2147483647) * 2 - 1)
   }
   return vector
+}
+
+function buildEmbeddingPayloadFromItem(item) {
+  let rawAttributes = {}
+  if (typeof item?.raw_attributes === 'string') {
+    try {
+      rawAttributes = JSON.parse(item.raw_attributes)
+    } catch {
+      rawAttributes = {}
+    }
+  }
+  const occasions = Array.isArray(rawAttributes.occasions) ? rawAttributes.occasions.join(', ') : ''
+  const style = rawAttributes.style_archetype ? `style ${rawAttributes.style_archetype}` : ''
+  const layeringRole = rawAttributes.layering_role ? `layers as ${rawAttributes.layering_role}` : ''
+  const pairings = Array.isArray(rawAttributes.pairings) ? rawAttributes.pairings.slice(0, 3).join(', ') : ''
+  const pairingHint = item.category === 'Bottoms'
+    ? 'pairs with: white shirt, loafers, blazer'
+    : item.category === 'Tops'
+      ? 'pairs with: navy chinos, clean sneakers'
+      : 'pairs with complementary neutrals'
+  return [
+    `${item.color_primary} ${item.item_type}`,
+    rawAttributes.pattern ? `pattern ${rawAttributes.pattern}` : '',
+    rawAttributes.fit ? `fit ${rawAttributes.fit}` : '',
+    item.material,
+    `formality ${item.formality}/10`,
+    `seasons ${Array.isArray(item.season) ? item.season.join('/') : 'all'}`,
+    occasions ? `occasions ${occasions}` : '',
+    style,
+    layeringRole,
+    pairings ? `pairings ${pairings}` : '',
+    pairingHint,
+  ].filter(Boolean).join(', ')
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length || a.length !== b.length) return 0
+  let dot = 0
+  let na = 0
+  let nb = 0
+  for (let i = 0; i < a.length; i += 1) {
+    const av = Number(a[i] ?? 0)
+    const bv = Number(b[i] ?? 0)
+    dot += av * bv
+    na += av * av
+    nb += bv * bv
+  }
+  if (na === 0 || nb === 0) return 0
+  return dot / (Math.sqrt(na) * Math.sqrt(nb))
+}
+
+function normText(value) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function colorFamily(value) {
+  const c = normText(value)
+  if (!c) return ''
+  if (c.includes('blue') || c.includes('navy') || c.includes('cobalt')) return 'blue'
+  if (c.includes('olive') || c.includes('green') || c.includes('khaki')) return 'green'
+  if (c.includes('white') || c.includes('cream') || c.includes('ecru')) return 'light-neutral'
+  if (c.includes('black') || c.includes('charcoal')) return 'dark-neutral'
+  if (c.includes('gray') || c.includes('grey')) return 'mid-neutral'
+  if (c.includes('brown') || c.includes('tan') || c.includes('taupe') || c.includes('camel')) return 'brown'
+  if (c.includes('red') || c.includes('burgundy') || c.includes('rust')) return 'red'
+  return c
 }
 
 function inferCategoryFromLabels(labels) {
@@ -1104,27 +1272,45 @@ async function fallbackInferFromVision(imageBuffer) {
     labels = (labelRes.labelAnnotations ?? []).map((l) => (l.description ?? '').trim()).filter(Boolean)
   }
   const category = inferCategoryFromLabels(labels)
-  const dominant = await dominantColorFromImage(imageBuffer)
-  const color_primary = dominant.name
+  // Dominant-color heuristics tend to get hijacked by large dark prints/logos.
+  // Prefer light neutrals (white/cream/very light gray) when present.
+  const paletteCandidates = await extractColorPaletteFromImage(imageBuffer)
+  const ordered = prioritizeLightNeutralsPrimary(paletteCandidates)
+  const primary = ordered?.[0]
+  const color_primary = primary?.name ?? (await dominantColorFromImage(imageBuffer)).name
   const quality = await scoreImageQuality(imageBuffer)
   const faces = await detectFaces(imageBuffer)
   quality.framing = inferFramingFromContext(faces, quality.occlusion_visible_pct)
+  const primary_hsl =
+    primary?.hsl ??
+    // Keep fallback behavior stable if palette extraction fails.
+    (await dominantColorFromImage(imageBuffer)).hsl
+
+  const color_palette = ordered?.length
+    ? ordered.slice(0, 3).map((c) => ({
+        name: c.name,
+        hex: c.hex,
+        hsl: c.hsl,
+        coverage_pct: c.coverage_pct,
+        is_neutral: c.is_neutral,
+      }))
+    : [
+        {
+          name: color_primary,
+          hex: '#8B7355',
+          hsl: primary_hsl,
+          coverage_pct: 1,
+          is_neutral: isNeutralHsl(primary_hsl),
+        },
+      ]
   return {
     item_type: inferTypeFromCategory(category),
     subtype: inferTypeFromCategory(category),
     category,
     color_primary,
     color_secondary: undefined,
-    color_primary_hsl: dominant.hsl,
-    color_palette: [
-      {
-        name: color_primary,
-        hex: '#8B7355',
-        hsl: dominant.hsl,
-        coverage_pct: 1,
-        is_neutral: isNeutralHsl(dominant.hsl),
-      },
-    ],
+    color_primary_hsl: primary_hsl,
+    color_palette,
     pattern: 'solid',
     material: 'Cotton',
     material_confidence: 0.55,
@@ -1159,6 +1345,8 @@ const GARMENT_LABELS = [
   'clothing', 'shirt', 'pants', 'trousers', 'jeans', 'jacket', 'coat',
   'dress', 'shoe', 'sneaker', 'boot', 'hoodie', 'skirt', 'shorts',
   'blazer', 'sweater', 'top', 'blouse', 'suit', 'vest', 'cardigan',
+  // DeepFashion2 class tokens that appear in `df2.names`
+  'outwear', 'sling',
   'bag', 'handbag', 'backpack', 'belt', 'hat', 'cap', 'scarf', 'watch',
 ]
 
@@ -1308,7 +1496,11 @@ app.post('/api/items/detect', async (req, res) => {
         const cropBuffer = await cropAndIsolateGarment(privacyBuffer, vertices, meta)
         const contrast = await contrastScore(cropBuffer)
         const lowerFrameBias = selfieMode ? Math.max(0.75, itemCy) : 1
-        const topwearBoost = /outerwear|jacket|coat|blazer|shirt|hoodie|sweater|top/i.test(obj.name ?? '') ? 1.08 : 1
+        const topwearBoost = /outerwear|outwear|jacket|coat|blazer|shirt|hoodie|sweater|vest|sling|top/i.test(
+          obj.name ?? '',
+        )
+          ? 1.08
+          : 1
         const accessoryPenalty = /watch|hat|cap|beanie|handbag|bag|belt/i.test(obj.name ?? '') ? 0.85 : 1
         const salience = salienceScore({ coverage, centrality, contrast }) * lowerFrameBias * topwearBoost * accessoryPenalty
         const partiallyVisible = coverage < 0.06
@@ -1436,6 +1628,7 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     services: {
       gemini: Boolean(genai),
+      gemini_api_key_source: genai ? geminiApiKeySource : undefined,
       faceDetection: Boolean(faceClient),
       visionSidecar: Boolean(visionSidecarUrl),
       tryonSidecar: Boolean(tryonSidecarUrl),
@@ -1592,7 +1785,7 @@ app.post('/api/tryon/preview', async (req, res) => {
 
 app.post('/api/items/preprocess', async (req, res) => {
   try {
-    const { imageUrl } = preprocessRequestSchema.parse(req.body)
+    const { imageUrl, maskPolygon } = preprocessRequestSchema.parse(req.body)
     const started = Date.now()
 
     // Items from /detect are already isolated crops — skip all Vision work.
@@ -1632,6 +1825,42 @@ app.post('/api/items/preprocess', async (req, res) => {
     const validation = await validateInputImage(buffer)
     if (!validation.ok) {
       return res.status(422).json({ error: validation.reason, code: 'INPUT_VALIDATION_FAILED' })
+    }
+
+    if (maskPolygon && maskPolygon.length >= 3) {
+      const masked = await maskPolygonToPng(buffer, maskPolygon)
+      const filename = `${crypto.randomUUID()}.png`
+      const filepath = path.join(processedDir, filename)
+      await fs.writeFile(filepath, masked)
+      return res.json({
+        processedImageUrl: `/storage/processed/${filename}`,
+        faceDetected: false,
+        faceBlurApplied: false,
+        personDetected: false,
+        garmentIsolated: true,
+        scene_track: 'flat_lay',
+        scene: { face_count: 0, garment_coverage: 1 },
+        validation: validation.metrics,
+        warnings: ['maskPolygon crop — downstream color uses alpha-aware stats.'],
+        metadata: {
+          provider: 'sharp+mask',
+          model: 'polygon-alpha-png',
+          latency_ms: Date.now() - started,
+          version: '3.2.0',
+          pipeline: {
+            architecture_id: PIPELINE_ARCHITECTURE_ID,
+            stages: [
+              { id: 'image_filtering', status: 'completed', detail: 'validateInputImage' },
+              { id: 'human_detection', status: 'skipped', detail: 'mask polygon' },
+              { id: 'human_parsing', status: 'skipped', detail: 'mask polygon' },
+              { id: 'privacy_masking', status: 'skipped', detail: 'user mask' },
+              { id: 'clothing_extraction', status: 'completed', detail: 'maskPolygon → bbox PNG' },
+              { id: 'attribute_inference', status: 'skipped', detail: 'next: /infer' },
+              { id: 'post_processing', status: 'skipped', detail: 'downstream' },
+            ],
+          },
+        },
+      })
     }
 
     // Phase 1: understand scene on raw frame before destructive edits.
@@ -1737,20 +1966,26 @@ app.post('/api/items/infer', async (req, res) => {
     if (!imageResponse.ok) throw new Error('Unable to read processed image')
     const imageBuffer = Buffer.from(await imageResponse.arrayBuffer())
     const base64Image = imageBuffer.toString('base64')
+    const inferMime = await detectImageMime(imageBuffer)
 
     try {
       const quality = await scoreImageQuality(imageBuffer)
       const faces = await detectFaces(imageBuffer)
       quality.framing = inferFramingFromContext(faces, quality.occlusion_visible_pct)
       const filterSignature = await detectFilterSignature(imageBuffer)
-      const colorAnalysisBuffer = filterSignature.risk >= 0.35
-        ? await normalizeForColorAnalysis(imageBuffer)
-        : imageBuffer
+      const innerCrop = Number(process.env.VESTIR_COLOR_INNER_CROP ?? '0.12')
+      const useClahe = process.env.VESTIR_COLOR_CLAHE !== '0'
+      const colorAnalysisBuffer = await prepareColorAnalysisBuffer(imageBuffer, {
+        innerCrop: Number.isFinite(innerCrop) ? innerCrop : 0.12,
+        grayWorld: true,
+        clahe: useClahe,
+      })
       if (filterSignature.likely_filter) {
         quality.warnings.push(`Image may use a ${filterSignature.kind} filter; color confidence reduced.`)
       }
 
       const structuralPrompt = `You are a fashion vision parser. Return strict JSON only for physical garment attributes.
+Lighting: assume neutral white balance for color names; ignore background walls/floors; focus on fabric pixels only.
 Context:
 - framing: ${quality.framing}
 - visible_pct_estimate: ${quality.occlusion_visible_pct.toFixed(2)}
@@ -1762,6 +1997,8 @@ Layering (critical for worn photos):
 - garment_type and category MUST describe that outer layer, not an inner tee/crewneck visible only at the neck unless the frame is clearly a top-only shot.
 - If a quilted/puffer/down/shell jacket or parka is visible, category is usually Outerwear and garment_type must say jacket/coat/puffer — not "shirt".
 - colors: first list the dominant colors of the OUTER garment's fabric (sleeves/body), not only a small inner neckline sliver. If multiple layers share the frame, weight colors by visible garment area.
+- If pattern is plaid/check/stripe, list TWO distinct garment colors when clearly visible (not background).
+
 Schema:
 {
   "garment_type":"string",
@@ -1769,11 +2006,56 @@ Schema:
   "category":"${CATEGORY_ENUM.join('|')}",
   "colors":[{"name":"string","hex":"#RRGGBB","coverage_pct":0-1,"confidence":0-1}],
   "pattern":"${PATTERN_ENUM.join('|')}",
+  "fit":"${FIT_ENUM.join('|')}",
   "construction_details":["string"],
   "material":{"primary":"string","confidence":0-1}
 }`
 
-      const structural = await runGeminiJson('gemini-2.5-flash', structuralSchema, structuralPrompt, base64Image)
+      const useProFirst =
+        filterSignature.risk >= 0.42 || quality.blur_score < 0.32 || quality.lighting_score < 0.32
+      const temps = [0.22, 0.38, 0.52, 0.44, 0.33]
+      let structural
+      /** @type {{ tier: string, samples: number, pro_tiebreaker: boolean }} */
+      let inferTrace = { tier: 'flash', samples: inferConsistencySamples, pro_tiebreaker: false }
+
+      if (inferConsistencySamples <= 1) {
+        const model = useProFirst ? inferProModel : inferFlashModel
+        structural = await runGeminiJson(model, structuralSchema, structuralPrompt, base64Image, {
+          mimeType: inferMime,
+          temperature: useProFirst ? 0.22 : 0.35,
+        })
+        inferTrace = { tier: useProFirst ? 'pro-hard-shot' : 'flash', samples: 1, pro_tiebreaker: false }
+      } else if (useProFirst) {
+        structural = await runGeminiJson(inferProModel, structuralSchema, structuralPrompt, base64Image, {
+          mimeType: inferMime,
+          temperature: 0.22,
+        })
+        inferTrace = { tier: 'pro-hard-shot', samples: 1, pro_tiebreaker: false }
+      } else {
+        const samples = []
+        for (let i = 0; i < inferConsistencySamples; i += 1) {
+          samples.push(
+            await runGeminiJson(inferFlashModel, structuralSchema, structuralPrompt, base64Image, {
+              mimeType: inferMime,
+              temperature: temps[i % temps.length],
+            }),
+          )
+        }
+        if (inferNeedsProTiebreaker(samples)) {
+          structural = await runGeminiJson(inferProModel, structuralSchema, structuralPrompt, base64Image, {
+            mimeType: inferMime,
+            temperature: 0.2,
+          })
+          inferTrace = {
+            tier: 'pro-tiebreaker',
+            samples: inferConsistencySamples,
+            pro_tiebreaker: true,
+          }
+        } else {
+          structural = pickStructuralByCategoryVote(samples)
+          inferTrace = { tier: 'flash-consensus', samples: inferConsistencySamples, pro_tiebreaker: false }
+        }
+      }
 
       const coerced = coerceCategoryForGarmentLabels(structural.garment_type, structural.subtype, structural.category)
       let resolvedGarmentType = structural.garment_type
@@ -1810,7 +2092,12 @@ Schema:
   "confidence":{"formality":0-1,"occasions":0-1,"style_archetype":0-1,"seasonality":0-1}
 }`
 
-      const semantic = await runGeminiJson('gemini-2.5-flash', semanticSchema, semanticPrompt, base64Image)
+      const semanticModel =
+        process.env.INFER_SEMANTIC_USE_PRO === '1' && useProFirst ? inferProModel : inferFlashModel
+      const semantic = await runGeminiJson(semanticModel, semanticSchema, semanticPrompt, base64Image, {
+        mimeType: inferMime,
+        temperature: 0.35,
+      })
 
       const modelColors = [...structural.colors]
         .sort((a, b) => b.coverage_pct - a.coverage_pct)
@@ -1845,7 +2132,7 @@ Schema:
           : shouldTrustVisionPrimary && primaryVision
             ? dedupePalette([primaryVision, ...visionColors, ...modelColors], 3)
             : dedupePalette([...modelColors, ...visionColors], 3)
-      const colors = mergedColors.length ? mergedColors : modelColors
+      const colors = prioritizeLightNeutralsPrimary(mergedColors.length ? mergedColors : modelColors)
 
       const seasonEntries = Object.entries(semantic.seasons)
       const season = seasonEntries
@@ -1899,6 +2186,7 @@ Schema:
         color_secondary_hsl: colors[1]?.hsl,
         color_palette: colors.map(({ confidence, ...c }) => c),
         pattern: structural.pattern,
+        fit: structural.fit && structural.fit !== 'unknown' ? structural.fit : undefined,
         material: structural.material.primary,
         material_confidence: structural.material.confidence,
         formality: semantic.formality,
@@ -1920,9 +2208,10 @@ Schema:
         ...parsed,
         metadata: {
           provider: 'google',
-          model: 'gemini-2.5-flash(two-pass)+lab-kmeans',
+          model: `gemini(${inferTrace.tier}+semantic)+lab-kmeans+grayworld`,
           latency_ms: Date.now() - started,
-          version: '2.1.0',
+          version: '2.2.0',
+          infer_routing: inferTrace,
           pipeline: {
             architecture_id: PIPELINE_ARCHITECTURE_ID,
             stages: [
@@ -1934,7 +2223,7 @@ Schema:
               {
                 id: 'attribute_inference',
                 status: 'completed',
-                detail: 'Gemini two-pass + LAB K-means palette merge',
+                detail: 'tiered Gemini + optional multi-sample + LAB/merge palette',
               },
               {
                 id: 'post_processing',
@@ -1960,47 +2249,58 @@ Schema:
 
 app.post('/api/items/embed', async (req, res) => {
   try {
-    if (!genai) return res.status(500).json({ error: 'GEMINI_API_KEY is missing' })
+    if (!genai && !embeddingSidecarUrl) {
+      return res.status(500).json({ error: 'Set GEMINI_API_KEY and/or EMBEDDING_SIDECAR_URL for embeddings' })
+    }
     const { item } = embedRequestSchema.parse(req.body)
     const started = Date.now()
-    let rawAttributes = {}
-    if (typeof item.raw_attributes === 'string') {
-      try {
-        rawAttributes = JSON.parse(item.raw_attributes)
-      } catch {
-        rawAttributes = {}
-      }
-    }
-    const occasions = Array.isArray(rawAttributes.occasions) ? rawAttributes.occasions.join(', ') : ''
-    const style = rawAttributes.style_archetype ? `style ${rawAttributes.style_archetype}` : ''
-    const layeringRole = rawAttributes.layering_role ? `layers as ${rawAttributes.layering_role}` : ''
-    const pairings = Array.isArray(rawAttributes.pairings) ? rawAttributes.pairings.slice(0, 3).join(', ') : ''
-    const pairingHint = item.category === 'Bottoms'
-      ? 'pairs with: white shirt, loafers, blazer'
-      : item.category === 'Tops'
-        ? 'pairs with: navy chinos, clean sneakers'
-        : 'pairs with complementary neutrals'
-    const payload = [
-      `${item.color_primary} ${item.item_type}`,
-      item.material,
-      `formality ${item.formality}/10`,
-      `seasons ${Array.isArray(item.season) ? item.season.join('/') : 'all'}`,
-      occasions ? `occasions ${occasions}` : '',
-      style,
-      layeringRole,
-      pairings ? `pairings ${pairings}` : '',
-      pairingHint,
-    ].filter(Boolean).join(', ')
+    const payload = buildEmbeddingPayloadFromItem(item)
     let values = []
     let modelUsed = embeddingModel
     let warning
+
+    if (embeddingSidecarUrl) {
+      try {
+        let imageBase64
+        if (item.image_url) {
+          const fetchUrl = item.image_url.startsWith('http')
+            ? item.image_url
+            : `http://127.0.0.1:${port}${item.image_url}`
+          const ir = await fetch(fetchUrl)
+          if (ir.ok) imageBase64 = Buffer.from(await ir.arrayBuffer()).toString('base64')
+        }
+        const er = await fetch(`${embeddingSidecarUrl.replace(/\/$/, '')}/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: payload, image_base64: imageBase64 }),
+          signal: AbortSignal.timeout(20000),
+        })
+        if (er.ok) {
+          const data = await er.json()
+          const vec = data.vector ?? data.values ?? data.embedding
+          if (Array.isArray(vec) && vec.length) {
+            values = vec
+            modelUsed = typeof data.model === 'string' ? data.model : 'embedding-sidecar'
+          }
+        } else {
+          warning = `Embedding sidecar HTTP ${er.status}`
+        }
+      } catch (e) {
+        warning = `Embedding sidecar: ${e instanceof Error ? e.message : 'unreachable'}`
+      }
+    }
+
     try {
-      const embedRes = await genai.models.embedContent({
-        model: embeddingModel,
-        contents: payload,
-      })
-      values = embedRes.embeddings?.[0]?.values ?? []
-      if (!values.length) throw new Error('Embedding API returned empty vector')
+      if (!values.length && genai) {
+        const embedRes = await genai.models.embedContent({
+          model: embeddingModel,
+          contents: payload,
+        })
+        values = embedRes.embeddings?.[0]?.values ?? []
+        if (!values.length) throw new Error('Embedding API returned empty vector')
+      } else if (!values.length) {
+        throw new Error('No embedding provider succeeded')
+      }
     } catch (embedError) {
       values = buildDeterministicFallbackVector(payload, 256)
       modelUsed = 'deterministic-fallback'
@@ -2013,23 +2313,145 @@ app.post('/api/items/embed', async (req, res) => {
       id: vectorId,
       item_id: item.id,
       vector: values,
+      item_snapshot: {
+        item_id: item.id,
+        image_url: item.image_url,
+        item_type: item.item_type,
+        category: item.category,
+        color_primary: item.color_primary,
+        material: item.material,
+      },
       created_at: new Date().toISOString(),
       model: modelUsed,
     })
     await fs.writeFile(embeddingsFile, JSON.stringify(existing), 'utf8')
+    const embedProvider =
+      modelUsed === 'deterministic-fallback'
+        ? 'server'
+        : modelUsed === embeddingModel
+          ? 'google'
+          : 'embedding-sidecar'
+
     res.json({
       vector_id: vectorId,
       dimensions: values.length,
       metadata: {
-        provider: modelUsed === 'deterministic-fallback' ? 'server' : 'google',
+        provider: embedProvider,
         model: modelUsed,
         latency_ms: Date.now() - started,
-        version: '1.0.0',
+        version: '1.1.0',
       },
       warning,
     })
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Embedding failed' })
+  }
+})
+
+app.post('/api/extension/match', async (req, res) => {
+  try {
+    const body = extensionMatchSchema.parse(req.body)
+    const started = Date.now()
+    const topK = body.topK ?? 5
+    const preprocess = await fetch(`http://127.0.0.1:${port}/api/items/preprocess`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageUrl: body.imageUrl }),
+    })
+    const preprocessJson = await preprocess.json()
+    if (!preprocess.ok) {
+      return res.status(400).json({
+        error: preprocessJson?.error ?? 'Preprocess failed for extension image',
+        code: 'EXTENSION_PREPROCESS_FAILED',
+      })
+    }
+    const infer = await fetch(`http://127.0.0.1:${port}/api/items/infer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ processedImageUrl: preprocessJson.processedImageUrl }),
+    })
+    const inferJson = await infer.json()
+    if (!infer.ok) {
+      return res.status(400).json({
+        error: inferJson?.error ?? 'Inference failed for extension image',
+        code: 'EXTENSION_INFER_FAILED',
+      })
+    }
+
+    const queryItem = {
+      id: `ext-${crypto.randomUUID()}`,
+      image_url: preprocessJson.processedImageUrl,
+      item_type: inferJson.item_type ?? 'Garment',
+      category: inferJson.category ?? 'Tops',
+      color_primary: inferJson.color_primary ?? 'Taupe',
+      material: inferJson.material ?? 'Unknown',
+      formality: inferJson.formality ?? 5,
+      season: Array.isArray(inferJson.season) ? inferJson.season : ['spring'],
+      raw_attributes: JSON.stringify(inferJson),
+    }
+    const payload = buildEmbeddingPayloadFromItem(queryItem)
+    const queryVector = genai
+      ? (await genai.models.embedContent({
+          model: embeddingModel,
+          contents: payload,
+        })).embeddings?.[0]?.values ?? buildDeterministicFallbackVector(payload, 256)
+      : buildDeterministicFallbackVector(payload, 256)
+
+    const entriesRaw = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
+    const entries = Array.isArray(entriesRaw) ? entriesRaw : []
+    const queryDim = Array.isArray(queryVector) ? queryVector.length : 0
+    const compatible = entries.filter((entry) => Array.isArray(entry.vector) && entry.vector.length === queryDim)
+    const ranked = compatible
+      .map((entry) => {
+        const embeddingScore = cosineSimilarity(queryVector, entry.vector)
+        const snapshot = entry.item_snapshot ?? null
+        const categoryBoost = snapshot && normText(snapshot.category) === normText(inferJson.category) ? 0.12 : 0
+        const colorBoost = snapshot && colorFamily(snapshot.color_primary) === colorFamily(inferJson.color_primary) ? 0.08 : 0
+        const finalScore = Math.max(0, Math.min(1, embeddingScore * 0.8 + categoryBoost + colorBoost))
+        return {
+          item_id: entry.item_id,
+          score: finalScore,
+          score_breakdown: {
+            embedding: Number(embeddingScore.toFixed(4)),
+            category_boost: Number(categoryBoost.toFixed(4)),
+            color_boost: Number(colorBoost.toFixed(4)),
+          },
+          snapshot,
+        }
+      })
+      .filter((x) => Number.isFinite(x.score) && x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK)
+
+    res.json({
+      query: {
+        title: body.title ?? null,
+        page_url: body.pageUrl ?? null,
+        image_url: body.imageUrl,
+        processed_image_url: preprocessJson.processedImageUrl,
+        inferred: {
+          item_type: inferJson.item_type,
+          category: inferJson.category,
+          color_primary: inferJson.color_primary,
+          material: inferJson.material,
+        },
+      },
+      matches: ranked,
+      metadata: {
+        provider: genai ? 'google' : 'deterministic-fallback',
+        model: genai ? embeddingModel : 'deterministic-fallback',
+        latency_ms: Date.now() - started,
+        version: '1.1.0',
+        query_dimensions: queryDim,
+        compared_items: compatible.length,
+        skipped_dimension_mismatch: Math.max(0, entries.length - compatible.length),
+      },
+    })
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : 'Extension matching failed',
+      code: 'EXTENSION_MATCH_FAILED',
+    })
   }
 })
 

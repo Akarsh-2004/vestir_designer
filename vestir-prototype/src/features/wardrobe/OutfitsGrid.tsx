@@ -3,9 +3,25 @@ import { ItemPhoto } from '../../components/ItemPhoto'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 import type { Item } from '../../types/index'
 
-export function OutfitsGrid() {
+interface OutfitsGridProps {
+  onBrowseItems: () => void
+}
+
+export function OutfitsGrid({ onBrowseItems }: OutfitsGridProps) {
   const outfits = useWardrobeStore((s) => s.outfits)
-  if (!outfits.length) return <EmptyState title="No outfits yet" description="Build one from an item detail page." />
+  if (!outfits.length) {
+    return (
+      <EmptyState
+        title="No outfits yet"
+        description="Start by picking an item. We'll help you pull a look together."
+        action={
+          <button className="btn" type="button" onClick={onBrowseItems}>
+            Browse items
+          </button>
+        }
+      />
+    )
+  }
 
   return (
     <div className="grid">

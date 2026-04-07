@@ -24,6 +24,7 @@ ENV/
 *.onnx
 *.weights
 runs/
+df2_yolov8_dataset/
 wandb/
 
 # Logs

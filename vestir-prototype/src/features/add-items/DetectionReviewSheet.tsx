@@ -1,4 +1,5 @@
 import { CheckCircle, Circle, Star } from 'lucide-react'
+import { toast } from 'sonner'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 import type { DetectedGarment } from '../../types/index'
 
@@ -42,7 +43,7 @@ function DetectionCard({ garment, selected, onToggle }: DetectionCardProps) {
       </div>
       <p className="detection-card__label">{garment.label}</p>
       {garment.partially_visible && (
-        <p className="detection-card__warn">Partial</p>
+        <p className="detection-card__warn">Partly visible</p>
       )}
     </button>
   )
@@ -75,6 +76,12 @@ export function DetectionReviewSheet() {
     }
   }
 
+  function handleConfirm() {
+    const label = selectedCount === 1 ? '1 item' : `${selectedCount} items`
+    toast.success(`Adding ${label} to your wardrobe…`)
+    confirmDetectedItems()
+  }
+
   return (
     <div className="sheet-scrim" onClick={dismissDetection}>
       <div
@@ -86,10 +93,10 @@ export function DetectionReviewSheet() {
         <div className="detection-sheet__header">
           <div>
             <h3 style={{ margin: 0, fontSize: '15px' }}>
-              {detected.length} item{detected.length !== 1 ? 's' : ''} found
+              We found {detected.length} item{detected.length !== 1 ? 's' : ''}
             </h3>
             <p style={{ margin: '2px 0 0', fontSize: '12px', opacity: 0.6 }}>
-              {scene_track === 'worn' ? 'Outfit photo' : scene_track === 'flat_lay' ? 'Flat lay' : 'Photo'} · tap to select
+              {scene_track === 'worn' ? 'Outfit photo' : scene_track === 'flat_lay' ? 'Flat lay' : 'Photo'} · tap the ones that look right
             </p>
           </div>
           <button
@@ -97,7 +104,7 @@ export function DetectionReviewSheet() {
             className="detection-sheet__toggle-all"
             onClick={toggleAll}
           >
-            {allSelected ? 'Deselect all' : 'Select all'}
+            {allSelected ? 'Clear selection' : 'Select all'}
           </button>
         </div>
 
@@ -117,10 +124,10 @@ export function DetectionReviewSheet() {
             type="button"
             className="btn"
             disabled={selectedCount === 0}
-            onClick={confirmDetectedItems}
+            onClick={handleConfirm}
             style={{ flex: 1 }}
           >
-            Add {selectedCount > 0 ? `${selectedCount} item${selectedCount !== 1 ? 's' : ''}` : 'selected'}
+            Add {selectedCount === 1 ? '1 item' : `${selectedCount} items`}
           </button>
           <button
             type="button"
@@ -128,7 +135,7 @@ export function DetectionReviewSheet() {
             onClick={dismissDetection}
             style={{ flex: 0, padding: '10px 14px' }}
           >
-            Cancel
+            Not now
           </button>
         </div>
       </div>

@@ -54,6 +54,7 @@ export const normalizeAttributesAdapter = async (raw: InferenceResult): Promise<
   return {
     item_type: raw.item_type.trim(),
     category: raw.category,
+    ...(raw.fit ? { fit: raw.fit } : {}),
     color_primary: canonicalizeColor(raw.color_primary) ?? 'Taupe',
     color_secondary: canonicalizeColor(raw.color_secondary),
     color_primary_hsl: raw.color_primary_hsl,

@@ -19,16 +19,18 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
     if (files.length === 1) {
       // Single file — use smart multi-item detect flow.
       try {
+        toast.info('Scanning your photo…')
         setDetecting(true)
         onClose()
         await detectItemsFromFile(files[0])
       } catch (error) {
         // Detection unavailable — fall back to direct pipeline.
         try {
+          toast.info("No worries—I'll process the photo directly.")
           await addPendingItemsFromFiles(files)
           await runHybridAiPipeline()
         } catch (pipelineError) {
-          toast.error(pipelineError instanceof Error ? pipelineError.message : 'AI pipeline failed.')
+          toast.error(pipelineError instanceof Error ? pipelineError.message : 'Something went wrong while processing your photo.')
         }
       } finally {
         setDetecting(false)
@@ -36,11 +38,12 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
     } else {
       // Multiple files — skip detect UX, process each directly.
       try {
+        toast.info(`Adding ${files.length} photos…`)
         onClose()
         await addPendingItemsFromFiles(files)
         await runHybridAiPipeline()
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : 'AI pipeline failed. Check API server.')
+        toast.error(error instanceof Error ? error.message : 'Something went wrong. Please try again.')
       }
     }
   }
@@ -50,13 +53,13 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
         <div className="sheet-handle" />
         <h3>Add Items</h3>
-        <button className="sheet-option" type="button">
+        <button className="sheet-option" type="button" disabled>
           <span className="sheet-icon">
             <Camera size={20} />
           </span>
           <span>
             <strong>Camera</strong>
-            <small>Take a photo of your item or outfit</small>
+            <small>Coming soon</small>
           </span>
         </button>
         <label className="sheet-option" style={{ opacity: detecting ? 0.6 : 1, pointerEvents: detecting ? 'none' : undefined }}>
@@ -75,6 +78,10 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
             onChange={handleFileChange}
           />
         </label>
+
+        <button className="btn secondary" type="button" onClick={onClose} style={{ width: '100%', justifyContent: 'center' }}>
+          Not now
+        </button>
       </div>
     </div>
   )

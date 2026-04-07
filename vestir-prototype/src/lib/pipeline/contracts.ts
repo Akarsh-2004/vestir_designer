@@ -45,6 +45,8 @@ export interface InferenceResult {
     is_neutral?: boolean
   }>
   pattern?: string
+  /** Silhouette / cut when model returns it (pipeline v2.2+). */
+  fit?: string
   material: string
   material_confidence?: number
   formality: number

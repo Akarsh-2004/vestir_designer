@@ -1,6 +1,7 @@
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react'
 import { useMemo } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { toast } from 'sonner'
 import { ItemPhoto } from '../../components/ItemPhoto'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 
@@ -33,22 +34,22 @@ export function ItemDetailScreen() {
     return [...(intro ? [intro] : []), ...q]
   }, [parsedAttrs])
 
-  if (!item) return <div className="card">Item not found.</div>
+  if (!item) return <div className="card">This item isn’t here anymore.</div>
 
   const processingDone = item.ai_processed && item.processing_stage === 'complete'
   const statusLine = processingDone
-    ? 'Ready'
+    ? 'Ready to style'
     : [item.processing_stage ?? 'queued', item.pipeline_substage ? ` · ${item.pipeline_substage}` : '']
         .join('')
-        .trim() || 'Processing'
+        .trim() || 'Working'
 
   return (
     <section className="card">
       <div className="detail-head">
-        <button className="icon-btn" onClick={() => navigate(-1)}>
+        <button className="icon-btn" type="button" onClick={() => navigate(-1)} aria-label="Back">
           <ArrowLeft size={16} />
         </button>
-        <button className="icon-btn">
+        <button className="icon-btn" type="button" disabled title="Editing coming soon" aria-disabled="true">
           <Pencil size={16} />
         </button>
       </div>
@@ -84,17 +85,21 @@ export function ItemDetailScreen() {
         ) : null}
       </div>
       <Link className="btn" to={`/finish-my-fit/${item.id}`}>
-        Build Outfit from This
+        Build a look from this
       </Link>
       <button
         className="danger-link"
+        type="button"
         onClick={() => {
+          const ok = window.confirm('Delete this item from your wardrobe? You can always add it again later.')
+          if (!ok) return
           deleteItem(item.id)
+          toast.success('Item removed.')
           navigate('/')
         }}
       >
         <Trash2 size={14} />
-        Delete Item
+        Delete item
       </button>
     </section>
   )

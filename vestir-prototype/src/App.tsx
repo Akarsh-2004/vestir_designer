@@ -14,9 +14,9 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">VESTIR Prototype</div>
+        <div className="brand">VESTIR</div>
         <nav className="nav">
-          <NavLink to="/">Home</NavLink>
+          <NavLink to="/">Wardrobe</NavLink>
           <NavLink to="/settings">Settings</NavLink>
         </nav>
       </header>

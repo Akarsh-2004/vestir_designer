@@ -5,7 +5,11 @@ import { ItemPhoto } from '../../components/ItemPhoto'
 import { SkeletonCard } from '../../components/SkeletonCard'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 
-export function ItemsGrid() {
+interface ItemsGridProps {
+  onAddItems: () => void
+}
+
+export function ItemsGrid({ onAddItems }: ItemsGridProps) {
   const allItems = useWardrobeStore((s) => s.items)
   const activeWardrobeId = useWardrobeStore((s) => s.activeWardrobeId)
   const activeCategory = useWardrobeStore((s) => s.activeCategory)
@@ -28,7 +32,19 @@ export function ItemsGrid() {
   }, [allItems, activeWardrobeId, activeCategory, searchQuery])
 
   const hasProcessing = items.some((i) => !i.ai_processed)
-  if (!items.length) return <EmptyState title="No items yet" description="Add photos to build your wardrobe." />
+  if (!items.length) {
+    return (
+      <EmptyState
+        title="Your wardrobe is getting started"
+        description="Add a photo and we'll sort your pieces into place."
+        action={
+          <button className="btn" type="button" onClick={onAddItems}>
+            Add a photo
+          </button>
+        }
+      />
+    )
+  }
 
   return (
     <div className="grid">
@@ -43,12 +59,12 @@ export function ItemsGrid() {
             <strong>{item.item_type}</strong>
             <small>{item.color_primary}</small>
             {!item.ai_processed ? (
-              <small>Processing… {item.processing_progress ?? 0}%</small>
+              <small>Making sense of your photo… {item.processing_progress ?? 0}%</small>
             ) : null}
           </div>
         </Link>
       ))}
-      {hasProcessing ? <div className="muted">AI enrichment running in background...</div> : null}
+      {hasProcessing ? <div className="muted">Working in the background—feel free to browse.</div> : null}
     </div>
   )
 }
