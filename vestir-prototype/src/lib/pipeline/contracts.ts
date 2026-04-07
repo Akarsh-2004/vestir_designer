@@ -5,6 +5,7 @@ import type {
   PipelineStageInfo,
   ProcessingStage,
   ProcessingStatus,
+  SubjectFilterConfig,
 } from '../../types/index'
 
 export interface PipelineMetadata {
@@ -93,7 +94,7 @@ export interface StageUpdate {
 }
 
 export interface PipelineAdapters {
-  preprocessImage: (imageUrl: string) => Promise<PreprocessResult>
+  preprocessImage: (imageUrl: string, subjectFilter?: SubjectFilterConfig) => Promise<PreprocessResult>
   inferAttributes: (processedImageUrl: string) => Promise<InferenceResult>
   normalizeAttributes: (raw: InferenceResult) => Promise<Partial<Item>>
   embedItem: (item: Item) => Promise<EmbeddingResult>

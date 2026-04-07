@@ -16,6 +16,89 @@ import numpy as np
 _cached_pt: str | None = None
 _cached_model: Any = None
 
+_GARMENT_KEYWORDS = {
+    "clothing",
+    "shirt",
+    "t-shirt",
+    "tee",
+    "top",
+    "blouse",
+    "jacket",
+    "coat",
+    "hoodie",
+    "sweater",
+    "cardigan",
+    "vest",
+    "dress",
+    "skirt",
+    "pants",
+    "trousers",
+    "jeans",
+    "shorts",
+    "shoe",
+    "sneaker",
+    "boot",
+    "bag",
+    "handbag",
+    "backpack",
+    "belt",
+    "scarf",
+    "tie",
+}
+
+
+def _is_garment_like(label: str) -> bool:
+    t = label.lower()
+    return any(k in t for k in _GARMENT_KEYWORDS)
+
+
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+def _torso_proxy_from_person_bbox(person_bbox: dict[str, float]) -> dict[str, float]:
+    """
+    Convert a person bbox to a torso-focused clothing proxy.
+    This keeps wardrobe crops useful even when the detector is generic COCO.
+    """
+    x1 = _clamp01(person_bbox["x1"])
+    y1 = _clamp01(person_bbox["y1"])
+    x2 = _clamp01(person_bbox["x2"])
+    y2 = _clamp01(person_bbox["y2"])
+    w = max(0.01, x2 - x1)
+    h = max(0.01, y2 - y1)
+
+    # Torso window tuned for tops/dresses in full-body fashion photos.
+    tx1 = _clamp01(x1 + 0.18 * w)
+    tx2 = _clamp01(x2 - 0.18 * w)
+    ty1 = _clamp01(y1 + 0.18 * h)
+    ty2 = _clamp01(y1 + 0.78 * h)
+
+    if tx2 <= tx1 or ty2 <= ty1:
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    return {"x1": tx1, "y1": ty1, "x2": tx2, "y2": ty2}
+
+
+def _generic_proxy_from_bbox(bbox: dict[str, float]) -> dict[str, float]:
+    """
+    Conservative crop used only when YOLO gives non-garment classes and no person.
+    Shrinks noisy full-frame detections toward the center.
+    """
+    x1 = _clamp01(bbox["x1"])
+    y1 = _clamp01(bbox["y1"])
+    x2 = _clamp01(bbox["x2"])
+    y2 = _clamp01(bbox["y2"])
+    w = max(0.01, x2 - x1)
+    h = max(0.01, y2 - y1)
+
+    gx1 = _clamp01(x1 + 0.14 * w)
+    gx2 = _clamp01(x2 - 0.14 * w)
+    gy1 = _clamp01(y1 + 0.10 * h)
+    gy2 = _clamp01(y2 - 0.08 * h)
+    if gx2 <= gx1 or gy2 <= gy1:
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    return {"x1": gx1, "y1": gy1, "x2": gx2, "y2": gy2}
+
 
 def _yolo_weight_spec_configured(spec: str) -> bool:
     """
@@ -102,7 +185,7 @@ def run_yolov8(image_bgr: np.ndarray) -> dict[str, Any] | None:
         names = {int(k): str(v) for k, v in raw_names.items()}
     else:
         names = {i: str(raw_names[i]) for i in range(len(raw_names))}
-    garments: list[dict[str, Any]] = []
+    detections: list[dict[str, Any]] = []
 
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy()
@@ -112,7 +195,7 @@ def run_yolov8(image_bgr: np.ndarray) -> dict[str, Any] | None:
         x1, y1, x2, y2 = xyxy[i]
         cid = int(clss[i])
         label = names.get(cid, f"class_{cid}")
-        garments.append(
+        detections.append(
             {
                 "label": label.replace("_", " "),
                 "confidence": round(float(confs[i]), 3),
@@ -125,11 +208,48 @@ def run_yolov8(image_bgr: np.ndarray) -> dict[str, Any] | None:
             }
         )
 
+    person_detections = [d for d in detections if d["label"].lower() == "person"]
+    person_count = len(person_detections)
+
+    garments = [d for d in detections if _is_garment_like(d["label"])]
+
+    # If the model is generic (e.g. COCO) and returns only person/non-garment classes,
+    # create torso clothing proxies so the wardrobe pipeline can still crop useful regions.
+    warnings: list[str] = []
+    if not garments and person_detections:
+        garments = [
+            {
+                "label": "clothing",
+                "confidence": round(max(0.35, min(0.9, d["confidence"] * 0.72)), 3),
+                "bbox": _torso_proxy_from_person_bbox(d["bbox"]),
+            }
+            for d in person_detections
+        ]
+        warnings.append("yolov8_person_to_torso_proxy")
+    elif not garments and detections:
+        # Last-resort fallback for generic COCO checkpoints that return only scene objects.
+        # Keep the highest-confidence large detection and center-shrink it.
+        best = max(
+            detections,
+            key=lambda d: (
+                d["confidence"],
+                (d["bbox"]["x2"] - d["bbox"]["x1"]) * (d["bbox"]["y2"] - d["bbox"]["y1"]),
+            ),
+        )
+        garments = [
+            {
+                "label": "clothing",
+                "confidence": round(max(0.3, min(0.85, best["confidence"] * 0.65)), 3),
+                "bbox": _generic_proxy_from_bbox(best["bbox"]),
+            }
+        ]
+        warnings.append("yolov8_generic_bbox_proxy")
+
     return {
-        "person_count": 1 if garments else 0,
-        "multi_person": False,
+        "person_count": person_count,
+        "multi_person": person_count > 1,
         "garments": garments,
         "privacy_regions": [],
-        "warnings": [],
+        "warnings": warnings,
         "model": "yolov8-ultralytics",
     }

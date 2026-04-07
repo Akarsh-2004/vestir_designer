@@ -180,10 +180,29 @@ const inferSchema = z.object({
   quality: qualitySchema,
 })
 
+const normalizedPointSchema = z.object({ x: z.number(), y: z.number() })
+const normalizedBboxSchema = z.object({
+  x1: z.number().min(0).max(1),
+  y1: z.number().min(0).max(1),
+  x2: z.number().min(0).max(1),
+  y2: z.number().min(0).max(1),
+})
+const subjectFilterSchema = z.object({
+  mode: z.enum(['keep_selected_person', 'clothing_only']).default('keep_selected_person'),
+  selectedPersonIds: z.array(z.string()).optional(),
+  selectedPersonBboxes: z.array(normalizedBboxSchema).optional(),
+  maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
+  aiAssist: z.boolean().optional(),
+}).optional()
+const detectRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  subjectFilter: subjectFilterSchema,
+})
 const preprocessRequestSchema = z.object({
   imageUrl: z.string().min(1),
   /** Normalized 0–1 vertices; garment interior stays opaque in a PNG for downstream color. */
-  maskPolygon: z.array(z.object({ x: z.number(), y: z.number() })).min(3).optional(),
+  maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
+  subjectFilter: subjectFilterSchema,
 })
 const inferRequestSchema = z.object({ processedImageUrl: z.string().min(1) })
 const embedRequestSchema = z.object({ item: z.any() })
@@ -1372,6 +1391,91 @@ function bboxOverlap(a, b) {
   return union > 0 ? intersection / union : 0
 }
 
+function buildPersonCandidates(personLike = []) {
+  return personLike
+    .map((obj, idx) => {
+      const vertices = obj.boundingPoly?.normalizedVertices ?? []
+      if (!vertices.length) return null
+      return {
+        id: `person-${idx + 1}`,
+        label: obj.name ?? 'person',
+        confidence: Number((obj.score ?? 0.5).toFixed(3)),
+        bbox: normalizedBbox(vertices),
+      }
+    })
+    .filter(Boolean)
+}
+
+function selectPersonBboxes(subjectFilter, personCandidates = []) {
+  const selectedIds = new Set(subjectFilter?.selectedPersonIds ?? [])
+  const selectedById = personCandidates
+    .filter((candidate) => selectedIds.has(candidate.id))
+    .map((candidate) => candidate.bbox)
+  if (selectedById.length > 0) return selectedById
+  if (Array.isArray(subjectFilter?.selectedPersonBboxes) && subjectFilter.selectedPersonBboxes.length > 0) {
+    return subjectFilter.selectedPersonBboxes
+  }
+  return []
+}
+
+function shouldKeepGarmentBySubjectFilter(subjectFilter, garmentBbox, selectedPersonBboxes = []) {
+  if (!subjectFilter) return true
+  if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) return true
+  if (subjectFilter.mode === 'clothing_only') return true
+  if (selectedPersonBboxes.length === 0) return true
+  return selectedPersonBboxes.some((personBbox) => bboxOverlap(personBbox, garmentBbox) >= 0.05)
+}
+
+function buildMaskSvg(width, height, regions = []) {
+  const rects = regions.map((bbox) => {
+    const x = Math.floor(Math.max(0, Math.min(1, bbox.x1)) * width)
+    const y = Math.floor(Math.max(0, Math.min(1, bbox.y1)) * height)
+    const w = Math.max(1, Math.ceil((Math.max(0, Math.min(1, bbox.x2)) - Math.max(0, Math.min(1, bbox.x1))) * width))
+    const h = Math.max(1, Math.ceil((Math.max(0, Math.min(1, bbox.y2)) - Math.max(0, Math.min(1, bbox.y1))) * height))
+    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="white" />`
+  }).join('')
+  return Buffer.from(
+    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" />${rects}</svg>`,
+  )
+}
+
+async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidates, garmentBoxes) {
+  if (!subjectFilter) return { buffer, warnings: [], applied: undefined }
+  if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) {
+    const maskedPng = await maskPolygonToPng(buffer, subjectFilter.maskPolygon)
+    const masked = await sharp(maskedPng).flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer()
+    return {
+      buffer: masked,
+      warnings: [],
+      applied: { ...subjectFilter },
+    }
+  }
+  const meta = await sharp(buffer).metadata()
+  const width = meta.width ?? 1
+  const height = meta.height ?? 1
+  const selectedPersonBboxes = selectPersonBboxes(subjectFilter, personCandidates)
+  const garmentRegions = garmentBoxes.map((box) => box.bbox)
+  const regions = subjectFilter.mode === 'clothing_only' ? garmentRegions : selectedPersonBboxes
+  if (!regions.length) {
+    return {
+      buffer,
+      warnings: ['Subject filter requested, but no selectable regions were found.'],
+      applied: { ...subjectFilter, selectedPersonBboxes },
+    }
+  }
+  const mask = buildMaskSvg(width, height, regions)
+  const masked = await sharp(buffer)
+    .composite([{ input: mask, blend: 'dest-in' }])
+    .flatten({ background: '#ffffff' })
+    .jpeg({ quality: 90 })
+    .toBuffer()
+  return {
+    buffer: masked,
+    warnings: [],
+    applied: { ...subjectFilter, selectedPersonBboxes },
+  }
+}
+
 function salienceScore({ coverage, centrality, contrast }) {
   return coverage * 0.5 + centrality * 0.3 + contrast * 0.2
 }
@@ -1415,7 +1519,7 @@ async function contrastScore(buffer) {
 
 app.post('/api/items/detect', async (req, res) => {
   try {
-    const { imageUrl } = preprocessRequestSchema.parse(req.body)
+    const { imageUrl, subjectFilter } = detectRequestSchema.parse(req.body)
     const started = Date.now()
     const buffer = await resolveImageBuffer(imageUrl)
 
@@ -1454,6 +1558,8 @@ app.post('/api/items/detect', async (req, res) => {
       const nameLc = (obj.name ?? '').toLowerCase()
       return /\bperson\b|people|^man$|^woman$|^boy$|^girl$|human/.test(nameLc)
     })
+    const personCandidates = buildPersonCandidates(personLike)
+    const selectedPersonBboxes = selectPersonBboxes(subjectFilter, personCandidates)
     const estimatedPersonCount = Math.max(
       Number(sidecar?.person_count ?? 0),
       personLike.length,
@@ -1470,6 +1576,11 @@ app.post('/api/items/detect', async (req, res) => {
         return GARMENT_LABELS.some((hint) => nameLc.includes(hint))
       })
       .filter((obj) => (obj.score ?? 0) >= 0.45)
+      .filter((obj) => {
+        const vertices = obj.boundingPoly?.normalizedVertices ?? []
+        if (!vertices.length) return false
+        return shouldKeepGarmentBySubjectFilter(subjectFilter, normalizedBbox(vertices), selectedPersonBboxes)
+      })
 
     // Deduplicate heavily overlapping boxes — keep higher-confidence one.
     const deduped = []
@@ -1486,6 +1597,9 @@ app.post('/api/items/detect', async (req, res) => {
     }
 
     // Score salience for each detected item.
+    const { buffer: filteredBuffer, warnings: subjectFilteringWarnings, applied: appliedSubjectFilter } =
+      await applySubjectFilterToBuffer(privacyBuffer, subjectFilter, personCandidates, deduped)
+    const filteredMeta = await sharp(filteredBuffer).metadata()
     const scored = await Promise.all(
       deduped.map(async ({ obj, bbox, vertices }) => {
         const coverage = (bbox.x2 - bbox.x1) * (bbox.y2 - bbox.y1)
@@ -1493,7 +1607,7 @@ app.post('/api/items/detect', async (req, res) => {
         const itemCy = (bbox.y1 + bbox.y2) / 2
         const dist = Math.sqrt((itemCx - cx) ** 2 + (itemCy - cy) ** 2)
         const centrality = Math.max(0, 1 - dist / 0.71)
-        const cropBuffer = await cropAndIsolateGarment(privacyBuffer, vertices, meta)
+        const cropBuffer = await cropAndIsolateGarment(filteredBuffer, vertices, filteredMeta)
         const contrast = await contrastScore(cropBuffer)
         const lowerFrameBias = selfieMode ? Math.max(0.75, itemCy) : 1
         const topwearBoost = /outerwear|outwear|jacket|coat|blazer|shirt|hoodie|sweater|vest|sling|top/i.test(
@@ -1530,7 +1644,7 @@ app.post('/api/items/detect', async (req, res) => {
     let items = []
     if (fallback) {
       const name = `${crypto.randomUUID()}.jpg`
-      await fs.writeFile(path.join(processedDir, name), privacyBuffer)
+      await fs.writeFile(path.join(processedDir, name), filteredBuffer)
       items = [{
         id: crypto.randomUUID(),
         label: 'Garment',
@@ -1567,23 +1681,31 @@ app.post('/api/items/detect', async (req, res) => {
         : 'ambiguous'
 
     const sourceFilename = `${crypto.randomUUID()}.jpg`
-    await fs.writeFile(path.join(processedDir, sourceFilename), privacyBuffer)
+    await fs.writeFile(path.join(processedDir, sourceFilename), filteredBuffer)
 
     const privacyApplied = privacyBuffer !== buffer
     const warnings = [
       ...(selfieMode ? ['Selfie-mode activated: face-dominant frame, garment salience re-weighted.'] : []),
       ...(multiPerson ? ['Multiple people in frame — crops are per detected garment; verify each selection.'] : []),
+      ...subjectFilteringWarnings,
     ]
 
     res.json({
       detected: items,
+      person_candidates: personCandidates,
       scene_track: track,
       source_image_url: `/storage/processed/${sourceFilename}`,
+      applied_subject_filter: appliedSubjectFilter,
       warnings,
       pipeline: {
         architecture_id: PIPELINE_ARCHITECTURE_ID,
         stages: [
           { id: 'image_filtering', status: 'completed', detail: 'validateInputImage' },
+          {
+            id: 'subject_filtering',
+            status: subjectFilter ? 'completed' : 'skipped',
+            detail: subjectFilter ? `mode=${subjectFilter.mode}` : 'not requested',
+          },
           {
             id: 'human_detection',
             status: 'completed',
@@ -1785,7 +1907,7 @@ app.post('/api/tryon/preview', async (req, res) => {
 
 app.post('/api/items/preprocess', async (req, res) => {
   try {
-    const { imageUrl, maskPolygon } = preprocessRequestSchema.parse(req.body)
+    const { imageUrl, maskPolygon, subjectFilter } = preprocessRequestSchema.parse(req.body)
     const started = Date.now()
 
     // Items from /detect are already isolated crops — skip all Vision work.
@@ -1809,6 +1931,7 @@ app.post('/api/items/preprocess', async (req, res) => {
             architecture_id: PIPELINE_ARCHITECTURE_ID,
             stages: [
               { id: 'image_filtering', status: 'skipped', detail: 'already validated at detect' },
+              { id: 'subject_filtering', status: 'skipped', detail: 'already filtered at detect/upload' },
               { id: 'human_detection', status: 'skipped', detail: 'crop from /detect' },
               { id: 'human_parsing', status: 'skipped', detail: 'optional SegFormer/FASHN' },
               { id: 'privacy_masking', status: 'skipped', detail: 'applied upstream if worn' },
@@ -1851,6 +1974,7 @@ app.post('/api/items/preprocess', async (req, res) => {
             architecture_id: PIPELINE_ARCHITECTURE_ID,
             stages: [
               { id: 'image_filtering', status: 'completed', detail: 'validateInputImage' },
+              { id: 'subject_filtering', status: 'completed', detail: 'manual mask polygon' },
               { id: 'human_detection', status: 'skipped', detail: 'mask polygon' },
               { id: 'human_parsing', status: 'skipped', detail: 'mask polygon' },
               { id: 'privacy_masking', status: 'skipped', detail: 'user mask' },
@@ -1866,6 +1990,9 @@ app.post('/api/items/preprocess', async (req, res) => {
     // Phase 1: understand scene on raw frame before destructive edits.
     const sidecar = await callVisionSidecarAnalyze(buffer)
     const rawFaces = await detectFaces(buffer)
+    const personCandidates = Array.isArray(sidecar?.garments)
+      ? []
+      : []
     const garmentRegions = Array.isArray(sidecar?.garments) && sidecar.garments.length > 0
       ? sidecar.garments
         .map((g) => ({
@@ -1889,10 +2016,13 @@ app.post('/api/items/preprocess', async (req, res) => {
     const { output, faceDetected, faceBlurApplied } = shouldBlurFaces
       ? await blurFaceRegions(buffer, regions)
       : { output: buffer, faceDetected: rawFaces.length > 0, faceBlurApplied: false }
+    const garmentBoxes = garmentRegions.map((region) => ({ bbox: normalizedBbox(region.vertices) }))
+    const { buffer: subjectFilteredBuffer, warnings: subjectFilterWarnings } =
+      await applySubjectFilterToBuffer(output, subjectFilter, personCandidates, garmentBoxes)
 
     // Crop to garment region (if available) to create clean subject for downstream color + inference.
-    const garmentRegion = primaryRegion?.vertices ?? await detectGarmentRegion(output)
-    const cropped = await cropToRegion(output, garmentRegion)
+    const garmentRegion = primaryRegion?.vertices ?? await detectGarmentRegion(subjectFilteredBuffer)
+    const cropped = await cropToRegion(subjectFilteredBuffer, garmentRegion)
     const filename = `${crypto.randomUUID()}.jpg`
     const filepath = path.join(processedDir, filename)
     await fs.writeFile(filepath, cropped)
@@ -1908,7 +2038,7 @@ app.post('/api/items/preprocess', async (req, res) => {
         garment_coverage: Number(garmentCoverage.toFixed(3)),
       },
       validation: validation.metrics,
-      warnings: [...(validation.warnings ?? []), ...(sceneWarning ? [sceneWarning] : [])],
+      warnings: [...(validation.warnings ?? []), ...(sceneWarning ? [sceneWarning] : []), ...subjectFilterWarnings],
       metadata: {
         provider: faceClient ? 'google-vision' : 'sharp-fallback',
         model: faceClient ? 'faceDetection+objectLocalization' : 'none',
@@ -1918,6 +2048,11 @@ app.post('/api/items/preprocess', async (req, res) => {
           architecture_id: PIPELINE_ARCHITECTURE_ID,
           stages: [
             { id: 'image_filtering', status: 'completed', detail: 'validateInputImage' },
+            {
+              id: 'subject_filtering',
+              status: subjectFilter ? 'completed' : 'skipped',
+              detail: subjectFilter ? `mode=${subjectFilter.mode}` : 'not requested',
+            },
             {
               id: 'human_detection',
               status: 'completed',
@@ -2390,12 +2525,53 @@ app.post('/api/extension/match', async (req, res) => {
       raw_attributes: JSON.stringify(inferJson),
     }
     const payload = buildEmbeddingPayloadFromItem(queryItem)
-    const queryVector = genai
-      ? (await genai.models.embedContent({
-          model: embeddingModel,
-          contents: payload,
-        })).embeddings?.[0]?.values ?? buildDeterministicFallbackVector(payload, 256)
-      : buildDeterministicFallbackVector(payload, 256)
+    let queryVector = []
+    let queryEmbeddingProvider = 'deterministic-fallback'
+    let queryEmbeddingModel = 'deterministic-fallback'
+    if (embeddingSidecarUrl) {
+      try {
+        const imageRes = await fetch(
+          preprocessJson.processedImageUrl.startsWith('http')
+            ? preprocessJson.processedImageUrl
+            : `http://127.0.0.1:${port}${preprocessJson.processedImageUrl}`,
+        )
+        const imageBase64 = imageRes.ok ? Buffer.from(await imageRes.arrayBuffer()).toString('base64') : undefined
+        const sidecarRes = await fetch(`${embeddingSidecarUrl.replace(/\/$/, '')}/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: payload, image_base64: imageBase64 }),
+          signal: AbortSignal.timeout(20000),
+        })
+        if (sidecarRes.ok) {
+          const data = await sidecarRes.json()
+          const vec = data.vector ?? data.values ?? data.embedding
+          if (Array.isArray(vec) && vec.length) {
+            queryVector = vec
+            queryEmbeddingProvider = 'embedding-sidecar'
+            queryEmbeddingModel = typeof data.model === 'string' ? data.model : 'embedding-sidecar'
+          }
+        }
+      } catch {
+        // Fall through to other providers.
+      }
+    }
+    if (!queryVector.length && genai) {
+      const gem = await genai.models.embedContent({
+        model: embeddingModel,
+        contents: payload,
+      })
+      const vec = gem.embeddings?.[0]?.values ?? []
+      if (vec.length) {
+        queryVector = vec
+        queryEmbeddingProvider = 'google'
+        queryEmbeddingModel = embeddingModel
+      }
+    }
+    if (!queryVector.length) {
+      queryVector = buildDeterministicFallbackVector(payload, 256)
+      queryEmbeddingProvider = 'server'
+      queryEmbeddingModel = 'deterministic-fallback'
+    }
 
     const entriesRaw = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
     const entries = Array.isArray(entriesRaw) ? entriesRaw : []
@@ -2438,8 +2614,8 @@ app.post('/api/extension/match', async (req, res) => {
       },
       matches: ranked,
       metadata: {
-        provider: genai ? 'google' : 'deterministic-fallback',
-        model: genai ? embeddingModel : 'deterministic-fallback',
+        provider: queryEmbeddingProvider,
+        model: queryEmbeddingModel,
         latency_ms: Date.now() - started,
         version: '1.1.0',
         query_dimensions: queryDim,

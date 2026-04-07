@@ -1,6 +1,15 @@
 import { create } from 'zustand'
 import { mockItems, mockOutfits, mockWardrobes } from '../data/mock'
-import type { ActiveView, Category, DetectedGarment, DetectionResult, Item, Outfit, Wardrobe } from '../types/index'
+import type {
+  ActiveView,
+  Category,
+  DetectedGarment,
+  DetectionResult,
+  Item,
+  Outfit,
+  SubjectFilterMode,
+  Wardrobe,
+} from '../types/index'
 import { defaultPipelineAdapters, detectItemsFromImage } from '../lib/pipeline/adapters'
 import { processItemPipeline } from '../lib/pipeline/orchestrator'
 
@@ -13,7 +22,11 @@ interface WardrobeStore {
   activeCategory: Category | 'All'
   searchQuery: string
   pendingDetection: DetectionResult | null
+  pendingDetectionImageUrl: string | null
   pendingDetectionSelections: Set<string>
+  subjectFilterMode: SubjectFilterMode
+  subjectFilterPersonSelections: Set<string>
+  subjectFilterMaskPolygon: Array<{ x: number; y: number }>
   setActiveWardrobe: (id: string) => void
   setActiveCategory: (cat: Category | 'All') => void
   setActiveView: (view: ActiveView) => void
@@ -25,6 +38,10 @@ interface WardrobeStore {
   addOutfit: (outfit: Outfit) => void
   detectItemsFromFile: (file: File) => Promise<void>
   toggleDetectionSelection: (id: string) => void
+  setSubjectFilterMode: (mode: SubjectFilterMode) => void
+  toggleSubjectFilterPersonSelection: (id: string) => void
+  setSubjectFilterMaskPolygon: (polygon: Array<{ x: number; y: number }>) => void
+  applySubjectFilter: () => Promise<DetectionResult | null>
   confirmDetectedItems: () => Promise<void>
   dismissDetection: () => void
   addPendingItemsFromFiles: (files: FileList | null) => Promise<void>
@@ -48,7 +65,11 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   activeCategory: 'All',
   searchQuery: '',
   pendingDetection: null,
+  pendingDetectionImageUrl: null,
   pendingDetectionSelections: new Set<string>(),
+  subjectFilterMode: 'keep_selected_person',
+  subjectFilterPersonSelections: new Set<string>(),
+  subjectFilterMaskPolygon: [],
 
   setActiveWardrobe: (id) => set({ activeWardrobeId: id }),
   setActiveCategory: (cat) => set({ activeCategory: cat }),
@@ -95,9 +116,20 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
 
   detectItemsFromFile: async (file) => {
     const imageUrl = await fileToDataUrl(file)
-    const result = await detectItemsFromImage(imageUrl)
+    const result = await detectItemsFromImage(imageUrl, {
+      mode: 'keep_selected_person',
+      aiAssist: true,
+    })
     const heroSelections = new Set(result.detected.filter((g) => g.is_hero).map((g) => g.id))
-    set({ pendingDetection: result, pendingDetectionSelections: heroSelections })
+    const defaultPeople = new Set((result.person_candidates ?? []).map((p) => p.id))
+    set({
+      pendingDetectionImageUrl: imageUrl,
+      pendingDetection: result,
+      pendingDetectionSelections: heroSelections,
+      subjectFilterMode: result.applied_subject_filter?.mode ?? 'keep_selected_person',
+      subjectFilterPersonSelections: defaultPeople,
+      subjectFilterMaskPolygon: result.applied_subject_filter?.maskPolygon ?? [],
+    })
   },
 
   toggleDetectionSelection: (id) =>
@@ -107,6 +139,40 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
       else next.add(id)
       return { pendingDetectionSelections: next }
     }),
+
+  setSubjectFilterMode: (mode) => set({ subjectFilterMode: mode }),
+
+  toggleSubjectFilterPersonSelection: (id) =>
+    set((state) => {
+      const next = new Set(state.subjectFilterPersonSelections)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return { subjectFilterPersonSelections: next }
+    }),
+
+  setSubjectFilterMaskPolygon: (polygon) => set({ subjectFilterMaskPolygon: polygon }),
+
+  applySubjectFilter: async () => {
+    const {
+      pendingDetectionImageUrl,
+      subjectFilterMode,
+      subjectFilterPersonSelections,
+      subjectFilterMaskPolygon,
+    } = get()
+    if (!pendingDetectionImageUrl) return null
+    const result = await detectItemsFromImage(pendingDetectionImageUrl, {
+      mode: subjectFilterMode,
+      selectedPersonIds: Array.from(subjectFilterPersonSelections),
+      maskPolygon: subjectFilterMaskPolygon.length >= 3 ? subjectFilterMaskPolygon : undefined,
+      aiAssist: true,
+    })
+    const heroSelections = new Set(result.detected.filter((g) => g.is_hero).map((g) => g.id))
+    set({
+      pendingDetection: result,
+      pendingDetectionSelections: heroSelections,
+    })
+    return result
+  },
 
   confirmDetectedItems: async () => {
     const { pendingDetection, pendingDetectionSelections, activeWardrobeId } = get()
@@ -136,7 +202,10 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
     set((state) => ({
       items: [...pending, ...state.items],
       pendingDetection: null,
+      pendingDetectionImageUrl: null,
       pendingDetectionSelections: new Set(),
+      subjectFilterMaskPolygon: [],
+      subjectFilterPersonSelections: new Set(),
     }))
     await Promise.all(
       pending.map((item) =>
@@ -156,7 +225,13 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   },
 
   dismissDetection: () =>
-    set({ pendingDetection: null, pendingDetectionSelections: new Set() }),
+    set({
+      pendingDetection: null,
+      pendingDetectionImageUrl: null,
+      pendingDetectionSelections: new Set(),
+      subjectFilterMaskPolygon: [],
+      subjectFilterPersonSelections: new Set(),
+    }),
 
   addPendingItemsFromFiles: async (files) => {
     if (!files || files.length === 0) return

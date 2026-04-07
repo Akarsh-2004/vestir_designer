@@ -42,12 +42,48 @@ button {
   font-size: 12px;
 }
 
+.query-card h2 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#queryImage {
+  width: 100%;
+  height: 170px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  margin-bottom: 10px;
+}
+
 #matches {
-  padding-left: 16px;
+  padding-left: 0;
   margin: 0;
+  list-style: none;
 }
 
 #matches li {
-  margin-bottom: 6px;
+  margin-bottom: 10px;
   font-size: 12px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.match-image {
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+  background: #f3f4f6;
+}
+
+.match-info {
+  padding: 8px;
+}
+
+.match-title {
+  font-weight: 600;
+  margin-bottom: 2px;
 }

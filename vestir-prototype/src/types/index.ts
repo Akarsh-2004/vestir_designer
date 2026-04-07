@@ -69,6 +69,35 @@ export interface DetectedGarment {
   warning?: string
 }
 
+export interface NormalizedPoint {
+  x: number
+  y: number
+}
+
+export interface NormalizedBBox {
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+}
+
+export type SubjectFilterMode = 'keep_selected_person' | 'clothing_only'
+
+export interface SubjectFilterConfig {
+  mode: SubjectFilterMode
+  selectedPersonIds?: string[]
+  selectedPersonBboxes?: NormalizedBBox[]
+  maskPolygon?: NormalizedPoint[]
+  aiAssist?: boolean
+}
+
+export interface PersonCandidate {
+  id: string
+  label: string
+  confidence: number
+  bbox: NormalizedBBox
+}
+
 export interface PipelineStageInfo {
   id: PipelineStageId
   status: 'completed' | 'skipped' | 'partial'
@@ -77,8 +106,10 @@ export interface PipelineStageInfo {
 
 export interface DetectionResult {
   detected: DetectedGarment[]
+  person_candidates?: PersonCandidate[]
   scene_track: 'worn' | 'flat_lay' | 'ambiguous'
   source_image_url: string
+  applied_subject_filter?: SubjectFilterConfig
   /** Server-reported alignment with the multi-stage architecture. */
   pipeline?: {
     architecture_id: string
@@ -94,6 +125,7 @@ export type ActiveView = 'items' | 'outfits'
 /** Multi-stage vision pipeline (each stage narrows the problem for the next). */
 export type PipelineStageId =
   | 'image_filtering'
+  | 'subject_filtering'
   | 'human_detection'
   | 'human_parsing'
   | 'privacy_masking'

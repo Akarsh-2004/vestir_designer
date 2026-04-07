@@ -1,13 +1,13 @@
 import type { EmbeddingResult, InferenceResult, PipelineAdapters, PreprocessResult, ReasoningResult } from './contracts'
-import type { DetectionResult, Item } from '../../types/index'
+import type { DetectionResult, Item, SubjectFilterConfig } from '../../types/index'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
-export async function detectItemsFromImage(imageUrl: string): Promise<DetectionResult> {
+export async function detectItemsFromImage(imageUrl: string, subjectFilter?: SubjectFilterConfig): Promise<DetectionResult> {
   const response = await fetch(`${API_BASE}/api/items/detect`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ imageUrl }),
+    body: JSON.stringify({ imageUrl, subjectFilter }),
   })
   const data = await response.json()
   if (!response.ok) throw new Error(data.error ?? 'Detection failed')
@@ -40,8 +40,8 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
   return data as T
 }
 
-export const localPreprocessAdapter = async (imageUrl: string): Promise<PreprocessResult> => {
-  return postJson<PreprocessResult>('/api/items/preprocess', { imageUrl })
+export const localPreprocessAdapter = async (imageUrl: string, subjectFilter?: SubjectFilterConfig): Promise<PreprocessResult> => {
+  return postJson<PreprocessResult>('/api/items/preprocess', { imageUrl, subjectFilter })
 }
 
 export const geminiInferenceAdapter = async (processedImageUrl: string): Promise<InferenceResult> => {

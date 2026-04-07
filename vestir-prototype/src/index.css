@@ -448,6 +448,132 @@ body {
   padding: 4px 0;
 }
 
+.subject-filter {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  margin-bottom: 12px;
+  background: #fff;
+}
+
+.subject-filter__title {
+  margin: 0;
+  font-size: 13px;
+}
+
+.subject-filter__hint {
+  margin: 3px 0 8px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.subject-filter__mode-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.subject-filter__mode {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.subject-filter__mode.is-active {
+  border-color: var(--primary);
+  background: rgba(200, 161, 138, 0.18);
+}
+
+.subject-filter__person-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  margin: 2px 0 6px;
+}
+
+.subject-filter__link {
+  border: 0;
+  background: none;
+  color: var(--cocoa);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.subject-filter__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.subject-filter__chip {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  text-transform: capitalize;
+}
+
+.subject-filter__chip.is-active {
+  border-color: var(--primary);
+}
+
+.subject-filter__image {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-bottom: 6px;
+  display: block;
+}
+
+.subject-filter__editor {
+  position: relative;
+}
+
+.subject-filter__overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: calc(100% - 6px);
+}
+
+.subject-filter__poly-fill {
+  fill: rgba(200, 161, 138, 0.3);
+  stroke: var(--primary);
+  stroke-width: 0.7;
+}
+
+.subject-filter__poly-line {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 0.8;
+  stroke-linejoin: round;
+}
+
+.subject-filter__point {
+  fill: white;
+  stroke: var(--cocoa);
+  stroke-width: 0.35;
+}
+
+.subject-filter__metrics {
+  display: flex;
+  gap: 10px;
+  font-size: 10px;
+  opacity: 0.75;
+  margin-bottom: 6px;
+}
+
+.subject-filter__actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
 .detection-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

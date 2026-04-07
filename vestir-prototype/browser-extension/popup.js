@@ -2,6 +2,8 @@ const apiInput = document.getElementById('apiBase')
 const matchBtn = document.getElementById('matchBtn')
 const statusEl = document.getElementById('status')
 const matchesEl = document.getElementById('matches')
+const queryCardEl = document.getElementById('queryCard')
+const queryImageEl = document.getElementById('queryImage')
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
@@ -13,21 +15,56 @@ function setStatus(text, isError = false) {
   statusEl.style.color = isError ? '#B91C1C' : '#374151'
 }
 
-function renderMatches(data) {
+function resolveImageUrl(url, apiBase) {
+  if (!url) return ''
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) return url
+  if (url.startsWith('/')) return `${apiBase}${url}`
+  return `${apiBase}/${url}`
+}
+
+function renderMatches(data, apiBase) {
   matchesEl.innerHTML = ''
+  const queryImageUrl = resolveImageUrl(data?.query?.processed_image_url || data?.query?.image_url, apiBase)
+  if (queryImageUrl) {
+    queryCardEl.hidden = false
+    queryImageEl.src = queryImageUrl
+  } else {
+    queryCardEl.hidden = true
+    queryImageEl.removeAttribute('src')
+  }
+
   const list = Array.isArray(data.matches) ? data.matches : []
   if (!list.length) {
     const li = document.createElement('li')
+    li.className = 'match-info'
     li.textContent = 'No closet matches found yet.'
     matchesEl.appendChild(li)
     return
   }
   for (const match of list) {
     const li = document.createElement('li')
+    const image = document.createElement('img')
+    image.className = 'match-image'
     const label = match.snapshot
       ? `${match.snapshot.color_primary} ${match.snapshot.item_type} (${match.snapshot.category})`
       : `Item ${match.item_id}`
-    li.textContent = `${label} - ${(match.score * 100).toFixed(1)}%`
+    const imageUrl = resolveImageUrl(match?.snapshot?.image_url, apiBase)
+    if (imageUrl) {
+      image.src = imageUrl
+      image.alt = label
+      li.appendChild(image)
+    }
+
+    const info = document.createElement('div')
+    info.className = 'match-info'
+    const title = document.createElement('div')
+    title.className = 'match-title'
+    title.textContent = label
+    const score = document.createElement('div')
+    score.textContent = `Similarity ${(match.score * 100).toFixed(1)}%`
+    info.appendChild(title)
+    info.appendChild(score)
+    li.appendChild(info)
     matchesEl.appendChild(li)
   }
 }
@@ -57,7 +94,7 @@ async function runMatch() {
     })
     const data = await response.json()
     if (!response.ok) throw new Error(data.error ?? 'Match request failed')
-    renderMatches(data)
+    renderMatches(data, apiBase)
     setStatus('Done')
   } catch (error) {
     setStatus(error instanceof Error ? error.message : 'Unexpected error', true)
