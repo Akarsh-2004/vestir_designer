@@ -8,11 +8,13 @@ import { GoogleGenAI } from '@google/genai'
 import vision from '@google-cloud/vision'
 import { z } from 'zod'
 import dotenv from 'dotenv'
+import { fashionColorNameFromLab } from './lib/fashionColorMap.mjs'
 import {
   prepareColorAnalysisBuffer,
   maskPolygonToPng,
   detectImageMime,
 } from './lib/vestirColor.mjs'
+import { runGemmaMlxVision } from './gemma-mlx-runner.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -53,6 +55,9 @@ const visionSidecarUrl = process.env.VISION_SIDECAR_URL ?? 'http://127.0.0.1:800
 const embeddingSidecarUrl = (process.env.EMBEDDING_SIDECAR_URL ?? '').trim()
 const inferFlashModel = process.env.VESTIR_INFER_FLASH_MODEL ?? 'gemini-2.5-flash'
 const inferProModel = process.env.VESTIR_INFER_PRO_MODEL ?? 'gemini-2.5-pro'
+const inferBackend = (process.env.VESTIR_INFER_BACKEND ?? 'hybrid_sidecar').toLowerCase()
+/** gemini_on_disagreement: second Gemini pass when vision-sidecar sets attribute_disagreement (skipped when skipArbitration). */
+const inferArbitrateMode = (process.env.VESTIR_INFER_ARBITRATE ?? '').trim().toLowerCase()
 const inferConsistencySamples = Math.min(
   5,
   Math.max(1, Number.parseInt(process.env.INFER_CONSISTENCY_SAMPLES ?? '1', 10) || 1),
@@ -142,6 +147,7 @@ const semanticSchema = z.object({
 })
 
 const inferSchema = z.object({
+  schema_version: z.number().int().min(1).default(2),
   item_type: z.string().min(1),
   subtype: z.string().min(1),
   category: z.enum(CATEGORY_ENUM),
@@ -156,6 +162,7 @@ const inferSchema = z.object({
     coverage_pct: z.number().min(0).max(1),
     is_neutral: z.boolean().optional(),
   })).min(1),
+  dominant_colors: z.array(z.string().regex(/^#[0-9a-fA-F]{6}$/)).min(1).max(3),
   pattern: z.enum(PATTERN_ENUM),
   fit: z.string().optional(),
   material: z.string().min(1),
@@ -177,6 +184,13 @@ const inferSchema = z.object({
     requires_user_confirmation: z.boolean(),
     uncertain_fields: z.array(z.string()),
   }),
+  source_image_stage: z.enum(['tryoff', 'blurred_fallback']).optional(),
+  gemini_style_notes: z.string().optional(),
+  gemini_design_tags: z.array(z.string()).optional(),
+  gemini_brand_like: z.array(z.object({
+    name: z.string(),
+    confidence: z.number().min(0).max(1),
+  })).optional(),
   quality: qualitySchema,
 })
 
@@ -203,8 +217,37 @@ const preprocessRequestSchema = z.object({
   /** Normalized 0–1 vertices; garment interior stays opaque in a PNG for downstream color. */
   maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
   subjectFilter: subjectFilterSchema,
+  removeBackground: z.boolean().optional(),
 })
-const inferRequestSchema = z.object({ processedImageUrl: z.string().min(1) })
+const inferRequestSchema = z.object({
+  processedImageUrl: z.string().min(1),
+  sourceImageStage: z.enum(['tryoff', 'blurred_fallback']).optional(),
+  forceGemini: z.boolean().optional(),
+  /** When true, skip Gemini disagreement arbitration (e.g. extension match latency). */
+  skipArbitration: z.boolean().optional(),
+})
+const advancedLocalRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  context: z.object({
+    item_type: z.string().optional(),
+    category: z.string().optional(),
+    color_primary: z.string().optional(),
+    material: z.string().optional(),
+    pattern: z.string().optional(),
+  }).optional(),
+})
+const advancedLocalGemmaSchema = z.object({
+  item_type: z.string().min(1).optional(),
+  category: z.enum(CATEGORY_ENUM).optional(),
+  color_primary: z.string().min(1).optional(),
+  material: z.string().min(1).optional(),
+  pattern: z.string().min(1).optional(),
+  confidence_overall: z.number().min(0).max(1).optional(),
+  design_tags: z.array(z.string()).max(20).optional(),
+  style_notes: z.string().max(600).optional(),
+  style_tags: z.array(z.string()).max(12).optional(),
+  occasions: z.array(z.string()).max(12).optional(),
+})
 const embedRequestSchema = z.object({ item: z.any() })
 const reasonRequestSchema = z.object({ item: z.any() })
 const extensionMatchSchema = z.object({
@@ -217,6 +260,20 @@ const tryonPreviewRequestSchema = z.object({
   personImageUrl: z.string().min(1),
   garmentImageUrl: z.string().min(1),
   seed: z.number().int().optional(),
+})
+
+const tryoffRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  garmentTarget: z
+    .enum(['outfit', 'ensemble', 'tshirt', 'dress', 'pants', 'jacket'])
+    .optional()
+    .default('outfit'),
+  seed: z.number().int().optional(),
+})
+const manualBlurRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  boxes: z.array(normalizedBboxSchema).min(1),
+  blurAmount: z.number().int().min(3).max(99).optional(),
 })
 
 const googleLensExperimentSchema = z.object({
@@ -254,6 +311,17 @@ async function resolveImageBuffer(imageUrl) {
   const response = await fetch(fetchUrl)
   if (!response.ok) throw new Error(`Could not fetch image: ${imageUrl}`)
   return Buffer.from(await response.arrayBuffer())
+}
+
+async function downscaleImageForInference(buffer, maxEdge = 1024) {
+  const meta = await sharp(buffer).metadata()
+  const width = Number(meta.width ?? 0)
+  const height = Number(meta.height ?? 0)
+  if (!width || !height || Math.max(width, height) <= maxEdge) return buffer
+  return sharp(buffer)
+    .resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 90 })
+    .toBuffer()
 }
 
 function isAlreadyProcessedUrl(imageUrl) {
@@ -350,9 +418,10 @@ async function validateInputImage(buffer) {
   }
   const blurVariance = variance(edge)
   if (blurVariance < 40) {
-    return { ok: false, reason: 'Photo is too blurry. Hold steady and retake the image.' }
+    warnings.push('Photo is very blurry; garment detection may fail.')
+  } else if (blurVariance < 75) {
+    warnings.push('Photo has mild blur; detail confidence may be lower.')
   }
-  if (blurVariance < 75) warnings.push('Photo has mild blur; detail confidence may be lower.')
 
   return {
     ok: true,
@@ -371,6 +440,53 @@ async function detectFaces(buffer) {
   if (!faceClient) return []
   const [result] = await faceClient.faceDetection({ image: { content: buffer } })
   return result.faceAnnotations ?? []
+}
+
+function normalizeBox(box) {
+  return {
+    x1: Math.max(0, Math.min(1, Number(box.x1 ?? 0))),
+    y1: Math.max(0, Math.min(1, Number(box.y1 ?? 0))),
+    x2: Math.max(0, Math.min(1, Number(box.x2 ?? 0))),
+    y2: Math.max(0, Math.min(1, Number(box.y2 ?? 0))),
+  }
+}
+
+function pixelRegionFromNormalizedBbox(bbox, width, height) {
+  const x1 = Math.floor(normalizeBox(bbox).x1 * width)
+  const y1 = Math.floor(normalizeBox(bbox).y1 * height)
+  const x2 = Math.ceil(normalizeBox(bbox).x2 * width)
+  const y2 = Math.ceil(normalizeBox(bbox).y2 * height)
+  const left = Math.max(0, Math.min(width - 1, x1))
+  const top = Math.max(0, Math.min(height - 1, y1))
+  const regionWidth = Math.max(1, Math.min(width - left, x2 - left))
+  const regionHeight = Math.max(1, Math.min(height - top, y2 - top))
+  return { left, top, width: regionWidth, height: regionHeight }
+}
+
+async function detectResidualFaces(buffer) {
+  const meta = await sharp(buffer).metadata()
+  const width = Math.max(1, meta.width ?? 1)
+  const height = Math.max(1, meta.height ?? 1)
+
+  const googleFaces = await detectFaces(buffer)
+  const googleRegions = googleFaces.map(extractBounds).filter(Boolean)
+  const sidecarFaces = await callVisionSidecarFaces(buffer)
+  const sidecarRegions = sidecarFaces
+    .map((face) => face?.bbox)
+    .filter(Boolean)
+    .map((bbox) => pixelRegionFromNormalizedBbox(bbox, width, height))
+
+  const all = [...googleRegions, ...sidecarRegions]
+  const normalized = all.map((region) => ({
+    x1: Number((region.left / width).toFixed(4)),
+    y1: Number((region.top / height).toFixed(4)),
+    x2: Number(((region.left + region.width) / width).toFixed(4)),
+    y2: Number(((region.top + region.height) / height).toFixed(4)),
+  }))
+  return {
+    count: normalized.length,
+    regions: normalized,
+  }
 }
 
 async function detectGarmentRegion(buffer) {
@@ -423,6 +539,50 @@ async function callVisionSidecarAnalyze(buffer) {
   }
 }
 
+async function callVisionSidecarFaces(buffer) {
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${visionSidecarUrl}/faces`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_base64: buffer.toString('base64'),
+      }),
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+    if (!response.ok) return []
+    const data = await response.json()
+    if (!data?.ok || !Array.isArray(data?.faces)) return []
+    return data.faces
+  } catch {
+    return []
+  }
+}
+
+async function callVisionSidecarInfer(buffer) {
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 45000)
+    const response = await fetch(`${visionSidecarUrl}/infer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_base64: buffer.toString('base64'),
+      }),
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+    if (!response.ok) return null
+    const data = await response.json()
+    if (!data || data.ok !== true || typeof data.result !== 'object') return null
+    return data.result
+  } catch {
+    return null
+  }
+}
+
 function verticesFromNormalizedBbox(bbox) {
   if (!bbox) return []
   const x1 = Math.max(0, Math.min(1, Number(bbox.x1 ?? 0)))
@@ -436,6 +596,21 @@ function verticesFromNormalizedBbox(bbox) {
     { x: x2, y: y2 },
     { x: x1, y: y2 },
   ]
+}
+
+function normalizedToPixelRegion(bbox, width, height) {
+  if (!bbox || !width || !height) return null
+  const x1 = Math.max(0, Math.min(1, Number(bbox.x1 ?? 0)))
+  const y1 = Math.max(0, Math.min(1, Number(bbox.y1 ?? 0)))
+  const x2 = Math.max(0, Math.min(1, Number(bbox.x2 ?? 0)))
+  const y2 = Math.max(0, Math.min(1, Number(bbox.y2 ?? 0)))
+  if (x2 <= x1 || y2 <= y1) return null
+  const left = Math.max(0, Math.floor(x1 * width))
+  const top = Math.max(0, Math.floor(y1 * height))
+  const right = Math.min(width, Math.ceil(x2 * width))
+  const bottom = Math.min(height, Math.ceil(y2 * height))
+  if (right <= left || bottom <= top) return null
+  return { left, top, width: right - left, height: bottom - top }
 }
 
 function normalizedRegionCoverage(vertices) {
@@ -487,6 +662,9 @@ function prioritizeLightNeutralsPrimary(colors, fallbackToCoverage = true) {
   // Pick the lightest neutral.
   candidates.sort((a, b) => Number((b.hsl?.l ?? 0) - (a.hsl?.l ?? 0)))
   const primary = candidates[0]
+  const primaryCoverage = Number(primary?.coverage_pct ?? 0)
+  // Do not force a light-neutral unless it is actually prominent.
+  if (primaryCoverage < 0.32) return colors
 
   const rest = colors
     .filter((c) => c !== primary)
@@ -620,7 +798,7 @@ function extractBounds(faceAnnotation) {
   return { left, top, width, height }
 }
 
-async function blurFaceRegions(buffer, regions) {
+async function blurFaceRegions(buffer, regions, blurSigma = 30) {
   if (!regions.length) return { output: buffer, faceDetected: false, faceBlurApplied: false }
   const base = sharp(buffer)
   const meta = await base.metadata()
@@ -631,7 +809,7 @@ async function blurFaceRegions(buffer, regions) {
     const width = Math.min(Math.floor(region.width), (meta.width ?? 0) - left)
     const height = Math.min(Math.floor(region.height), (meta.height ?? 0) - top)
     if (width <= 0 || height <= 0) continue
-    const patch = await sharp(buffer).extract({ left, top, width, height }).blur(30).toBuffer()
+    const patch = await sharp(buffer).extract({ left, top, width, height }).blur(blurSigma).toBuffer()
     composites.push({ input: patch, left, top })
   }
   if (!composites.length) return { output: buffer, faceDetected: true, faceBlurApplied: false }
@@ -665,6 +843,13 @@ async function cropToRegion(buffer, normalizedVertices) {
   const cropH = Math.max(1, bottom - top)
 
   return sharp(buffer).extract({ left, top, width: cropW, height: cropH }).jpeg({ quality: 90 }).toBuffer()
+}
+
+async function removeBackgroundForGarment(buffer) {
+  // Lightweight background suppression: trims uniform margins after garment crop.
+  // This does not do full segmentation but improves cluttered borders for inference.
+  const trimmed = await sharp(buffer).trim({ threshold: 18 }).toBuffer()
+  return sharp(trimmed).jpeg({ quality: 90 }).toBuffer()
 }
 
 function hslFromColorName(name) {
@@ -876,14 +1061,16 @@ async function extractLabKMeansPalette(imageBuffer, k = 4) {
     }
     const total = pixels.length
     return rgbBuckets
-      .filter((bucket) => bucket.n > 0)
-      .map((bucket) => {
+      .map((bucket, idx) => ({ bucket, lab: centroids[idx] }))
+      .filter(({ bucket }) => bucket.n > 0)
+      .map(({ bucket, lab }) => {
         const r = bucket.r / bucket.n
         const g = bucket.g / bucket.n
         const b = bucket.b / bucket.n
         const hsl = rgbToHsl(r, g, b)
+        const name = lab ? fashionColorNameFromLab(lab.L, lab.a, lab.b) : colorNameFromHsl(hsl)
         return {
-          name: colorNameFromHsl(hsl),
+          name,
           hex: rgbToHex(r, g, b),
           hsl,
           coverage_pct: Number((bucket.n / Math.max(1, total)).toFixed(3)),
@@ -1155,6 +1342,46 @@ async function runGeminiJson(model, schema, prompt, base64Image, options = {}) {
   return schema.parse(JSON.parse(payload))
 }
 
+const arbitrateHybridSchema = z.object({
+  item_type: z.string().min(1),
+  category: z.enum(CATEGORY_ENUM),
+  confidence: z.number().min(0).max(1).optional(),
+})
+
+/**
+ * Gemini tie-breaker when SigLIP / Florence / category vote disagree (upload infer only).
+ * @param {Buffer} imageBuffer
+ * @param {Record<string, unknown>} sidecarInfer
+ */
+async function arbitrateHybridDisagreement(imageBuffer, sidecarInfer) {
+  const dbg = sidecarInfer?.metadata?.debug ?? {}
+  const inferMime = await detectImageMime(imageBuffer)
+  const prompt = `You arbitrate garment taxonomy when vision submodels disagree. Look at the clothing crop; return JSON only.
+Context (may be wrong):
+- SigLIP_top3: ${JSON.stringify(dbg.siglip_top3 ?? [])}
+- Florence_labels: ${JSON.stringify(dbg.florence_labels ?? [])}
+- Category_vote: ${JSON.stringify(dbg.category_vote ?? '')}
+- Super_category: ${JSON.stringify(dbg.super_category ?? '')}
+- Current_pick: item_type=${JSON.stringify(sidecarInfer.item_type)}, category=${JSON.stringify(sidecarInfer.category)}
+
+Schema:
+{"item_type":"single lowercase token like tshirt, jeans, dress, jacket, shorts, skirt, sweater, coat, blazer",
+"category":"Tops|Bottoms|Outerwear|Shoes|Accessories",
+"confidence":0-1}
+Describe the primary visible garment only.`
+  const base64 = imageBuffer.toString('base64')
+  const parsed = await runGeminiJson(inferFlashModel, arbitrateHybridSchema, prompt, base64, {
+    mimeType: inferMime,
+    temperature: 0.2,
+  })
+  const it = parsed.item_type
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/-/g, '_')
+  return { item_type: it, category: parsed.category }
+}
+
 function majorityPick(samples, keyFn) {
   const counts = new Map()
   for (const s of samples) {
@@ -1230,6 +1457,20 @@ function buildEmbeddingPayloadFromItem(item) {
   ].filter(Boolean).join(', ')
 }
 
+function buildEmbeddingCacheKey(item, payload) {
+  const attributes = typeof item?.raw_attributes === 'string' ? item.raw_attributes : JSON.stringify(item?.raw_attributes ?? {})
+  return [
+    normText(item?.item_type),
+    normText(item?.category),
+    normText(item?.color_primary),
+    normText(item?.material),
+    Number(item?.formality ?? 0),
+    Array.isArray(item?.season) ? item.season.map((s) => normText(s)).sort().join('|') : '',
+    attributes,
+    payload,
+  ].join('::')
+}
+
 function cosineSimilarity(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length || a.length !== b.length) return 0
   let dot = 0
@@ -1267,7 +1508,17 @@ function inferCategoryFromLabels(labels) {
   const text = labels.join(' ').toLowerCase()
   if (text.includes('shoe') || text.includes('sneaker') || text.includes('boot')) return 'Shoes'
   if (text.includes('jacket') || text.includes('coat') || text.includes('outerwear')) return 'Outerwear'
-  if (text.includes('pant') || text.includes('jean') || text.includes('trouser') || text.includes('short')) return 'Bottoms'
+  if (
+    text.includes('pant') ||
+    text.includes('jean') ||
+    text.includes('trouser') ||
+    text.includes('short') ||
+    text.includes('legging') ||
+    text.includes('jogger') ||
+    text.includes('track pant') ||
+    text.includes('sweatpant') ||
+    text.includes('tights')
+  ) return 'Bottoms'
   if (text.includes('belt') || text.includes('bag') || text.includes('scarf') || text.includes('hat')) return 'Accessories'
   return 'Tops'
 }
@@ -1283,12 +1534,31 @@ function inferTypeFromCategory(category) {
   return byCategory[category] ?? 'Garment'
 }
 
+function inferBottomSubtypeFromLabels(labels) {
+  const text = labels.join(' ').toLowerCase()
+  if (text.includes('short')) return 'Shorts'
+  if (text.includes('legging') || text.includes('tights')) return 'Leggings'
+  if (text.includes('jean')) return 'Jeans'
+  if (text.includes('jogger') || text.includes('sweatpant') || text.includes('track pant')) return 'Joggers'
+  if (text.includes('trouser') || text.includes('pant')) return 'Trousers'
+  return 'Bottoms'
+}
+
 async function fallbackInferFromVision(imageBuffer) {
   const started = Date.now()
   let labels = []
   if (faceClient) {
     const [labelRes] = await faceClient.labelDetection({ image: { content: imageBuffer } })
     labels = (labelRes.labelAnnotations ?? []).map((l) => (l.description ?? '').trim()).filter(Boolean)
+    try {
+      const [objRes] = await faceClient.objectLocalization({ image: { content: imageBuffer } })
+      const objectLabels = (objRes.localizedObjectAnnotations ?? [])
+        .map((o) => (o.name ?? '').trim())
+        .filter(Boolean)
+      labels = [...labels, ...objectLabels]
+    } catch {
+      // keep fallback resilient if object localization fails
+    }
   }
   const category = inferCategoryFromLabels(labels)
   // Dominant-color heuristics tend to get hijacked by large dark prints/logos.
@@ -1322,14 +1592,25 @@ async function fallbackInferFromVision(imageBuffer) {
           is_neutral: isNeutralHsl(primary_hsl),
         },
       ]
+  const meta = await sharp(imageBuffer).metadata()
+  const width = Math.max(1, meta.width ?? 1)
+  const height = Math.max(1, meta.height ?? 1)
+  const aspect = width / height
+  let inferredType = inferTypeFromCategory(category)
+  if (category === 'Bottoms') {
+    inferredType = inferBottomSubtypeFromLabels(labels)
+    if (inferredType === 'Bottoms' && aspect >= 0.85) inferredType = 'Shorts'
+  }
   return {
-    item_type: inferTypeFromCategory(category),
-    subtype: inferTypeFromCategory(category),
+    schema_version: 2,
+    item_type: inferredType,
+    subtype: inferredType,
     category,
     color_primary,
     color_secondary: undefined,
     color_primary_hsl: primary_hsl,
     color_palette,
+    dominant_colors: color_palette.map((c) => c.hex).slice(0, 3),
     pattern: 'solid',
     material: 'Cotton',
     material_confidence: 0.55,
@@ -1442,10 +1723,10 @@ function buildMaskSvg(width, height, regions = []) {
 async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidates, garmentBoxes) {
   if (!subjectFilter) return { buffer, warnings: [], applied: undefined }
   if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) {
-    const maskedPng = await maskPolygonToPng(buffer, subjectFilter.maskPolygon)
-    const masked = await sharp(maskedPng).flatten({ background: '#ffffff' }).jpeg({ quality: 90 }).toBuffer()
+    // In detect flow, preserve all garments and store polygon as a manual hint.
+    // Hard-masking here can hide other garments and collapse multi-item results.
     return {
-      buffer: masked,
+      buffer,
       warnings: [],
       applied: { ...subjectFilter },
     }
@@ -1533,8 +1814,31 @@ app.post('/api/items/detect', async (req, res) => {
     const h = meta.height ?? 1
 
     const rawFaces = await detectFaces(buffer)
-    const selfieMode = faceCoverageRatio(rawFaces, w, h) >= 0.25
-    const faceRegions = rawFaces.map(extractBounds).filter(Boolean)
+    const sidecarFaces = await callVisionSidecarFaces(buffer)
+    const gcvFaceRegions = rawFaces.map(extractBounds).filter(Boolean)
+    const sidecarFaceRegions = sidecarFaces
+      .map((f) => normalizedToPixelRegion(f.bbox, w, h))
+      .filter(Boolean)
+    const faceRegions = sidecarFaceRegions.length > 0 ? sidecarFaceRegions : gcvFaceRegions
+    const faceCandidates = (sidecarFaces.length > 0
+      ? sidecarFaces.map((f, idx) => ({
+        id: `face-${idx + 1}`,
+        confidence: Number(Number(f.confidence ?? 0.7).toFixed(3)),
+        bbox: f.bbox,
+        source: f.source ?? 'vision-sidecar',
+      }))
+      : gcvFaceRegions.map((r, idx) => ({
+        id: `face-${idx + 1}`,
+        confidence: 0.7,
+        bbox: {
+          x1: Number((r.left / w).toFixed(4)),
+          y1: Number((r.top / h).toFixed(4)),
+          x2: Number(((r.left + r.width) / w).toFixed(4)),
+          y2: Number(((r.top + r.height) / h).toFixed(4)),
+        },
+        source: 'google-vision',
+      })))
+    const selfieMode = faceRegions.length > 0 && (faceRegions.reduce((sum, r) => sum + (r.width * r.height), 0) / (w * h)) >= 0.25
 
     const sidecar = await callVisionSidecarAnalyze(buffer)
 
@@ -1551,8 +1855,8 @@ app.post('/api/items/detect', async (req, res) => {
       objectResult = r.localizedObjectAnnotations ?? []
     }
 
-    const privacyBuffer =
-      selfieMode && faceRegions.length > 0 ? (await blurFaceRegions(buffer, faceRegions)).output : buffer
+    const { output: privacyBuffer, faceBlurApplied } =
+      faceRegions.length > 0 ? await blurFaceRegions(buffer, faceRegions) : { output: buffer, faceBlurApplied: false }
 
     const personLike = objectResult.filter((obj) => {
       const nameLc = (obj.name ?? '').toLowerCase()
@@ -1563,7 +1867,7 @@ app.post('/api/items/detect', async (req, res) => {
     const estimatedPersonCount = Math.max(
       Number(sidecar?.person_count ?? 0),
       personLike.length,
-      rawFaces.length,
+      faceRegions.length,
     )
     const multiPerson = estimatedPersonCount > 1
 
@@ -1575,7 +1879,7 @@ app.post('/api/items/detect', async (req, res) => {
         const nameLc = (obj.name ?? '').toLowerCase()
         return GARMENT_LABELS.some((hint) => nameLc.includes(hint))
       })
-      .filter((obj) => (obj.score ?? 0) >= 0.45)
+      .filter((obj) => (obj.score ?? 0) >= 0.32)
       .filter((obj) => {
         const vertices = obj.boundingPoly?.normalizedVertices ?? []
         if (!vertices.length) return false
@@ -1588,7 +1892,7 @@ app.post('/api/items/detect', async (req, res) => {
       const vertices = obj.boundingPoly?.normalizedVertices ?? []
       if (!vertices.length) continue
       const bbox = normalizedBbox(vertices)
-      const overlapping = deduped.findIndex((d) => bboxOverlap(d.bbox, bbox) > 0.6)
+    const overlapping = deduped.findIndex((d) => bboxOverlap(d.bbox, bbox) > 0.8)
       if (overlapping === -1) {
         deduped.push({ obj, bbox, vertices })
       } else if ((obj.score ?? 0) > (deduped[overlapping].obj.score ?? 0)) {
@@ -1599,6 +1903,19 @@ app.post('/api/items/detect', async (req, res) => {
     // Score salience for each detected item.
     const { buffer: filteredBuffer, warnings: subjectFilteringWarnings, applied: appliedSubjectFilter } =
       await applySubjectFilterToBuffer(privacyBuffer, subjectFilter, personCandidates, deduped)
+    // Keep detection stable/fast by default; opt in explicitly for try-off-first detect.
+    const enableTryoffInDetect = process.env.VESTIR_TRYOFF_FIRST === '1'
+    let sourceStage = 'blurred_fallback'
+    let sourceBuffer = filteredBuffer
+    if (enableTryoffInDetect) {
+      const tryoff = await runTryoffWithBuffer(filteredBuffer, 'outfit')
+      if (tryoff.implemented && tryoff.resultBuffer) {
+        sourceBuffer = tryoff.resultBuffer
+        sourceStage = 'tryoff'
+      } else if (tryoff.message) {
+        subjectFilteringWarnings.push(`Try-off fallback used: ${tryoff.message}`)
+      }
+    }
     const filteredMeta = await sharp(filteredBuffer).metadata()
     const scored = await Promise.all(
       deduped.map(async ({ obj, bbox, vertices }) => {
@@ -1642,22 +1959,7 @@ app.post('/api/items/detect', async (req, res) => {
     // Fallback: if Vision found nothing, return the whole image as one item.
     const fallback = sorted.length === 0
     let items = []
-    if (fallback) {
-      const name = `${crypto.randomUUID()}.jpg`
-      await fs.writeFile(path.join(processedDir, name), filteredBuffer)
-      items = [{
-        id: crypto.randomUUID(),
-        label: 'Garment',
-        confidence: 0.5,
-        crop_url: `/storage/processed/${name}`,
-        coverage: 1,
-        centrality: 1,
-        salience: 0.5,
-        is_hero: true,
-        partially_visible: false,
-        warning: 'Single-item fallback: garment detection unavailable.',
-      }]
-    } else {
+    if (!fallback) {
       items = sorted.map((entry, idx) => ({
           id: crypto.randomUUID(),
           label: entry.obj.name ?? 'Garment',
@@ -1680,21 +1982,33 @@ app.post('/api/items/detect', async (req, res) => {
         ? 'flat_lay'
         : 'ambiguous'
 
+    const privacyApplied = faceBlurApplied
+    let autoBlurUrl = null
+    if (privacyApplied) {
+      const autoBlurFilename = `${crypto.randomUUID()}.jpg`
+      await fs.writeFile(path.join(processedDir, autoBlurFilename), privacyBuffer)
+      autoBlurUrl = `/storage/processed/${autoBlurFilename}`
+    }
     const sourceFilename = `${crypto.randomUUID()}.jpg`
-    await fs.writeFile(path.join(processedDir, sourceFilename), filteredBuffer)
-
-    const privacyApplied = privacyBuffer !== buffer
+    await fs.writeFile(path.join(processedDir, sourceFilename), sourceBuffer)
     const warnings = [
+      ...(validation.warnings ?? []),
       ...(selfieMode ? ['Selfie-mode activated: face-dominant frame, garment salience re-weighted.'] : []),
       ...(multiPerson ? ['Multiple people in frame — crops are per detected garment; verify each selection.'] : []),
+      ...(sidecar ? [] : ['Vision sidecar unavailable — advanced garment parsing skipped.']),
       ...subjectFilteringWarnings,
+      ...(fallback ? ['No garment found in this photo. Try closer framing or better lighting.'] : []),
     ]
 
     res.json({
       detected: items,
       person_candidates: personCandidates,
+      face_candidates: faceCandidates,
       scene_track: track,
       source_image_url: `/storage/processed/${sourceFilename}`,
+      source_image_stage: sourceStage,
+      auto_blurred_image_url: autoBlurUrl,
+      manual_blur_required: faceCandidates.length > 0,
       applied_subject_filter: appliedSubjectFilter,
       warnings,
       pipeline: {
@@ -1714,6 +2028,21 @@ app.post('/api/items/detect', async (req, res) => {
               : faceClient
                 ? 'objectLocalization(raw)+faces'
                 : 'faces-only (no Vision client)',
+          },
+          {
+            id: 'face_detection',
+            status: faceCandidates.length > 0 ? 'completed' : 'partial',
+            detail: faceCandidates.length > 0 ? 'retinaface(hf)/fallback' : 'no faces detected',
+          },
+          {
+            id: 'auto_blur',
+            status: privacyApplied ? 'completed' : 'skipped',
+            detail: privacyApplied ? 'automatic face blur applied' : 'no blur needed',
+          },
+          {
+            id: 'tryoff_extraction',
+            status: sourceStage === 'tryoff' ? 'completed' : 'partial',
+            detail: sourceStage === 'tryoff' ? 'fal virtual tryoff lora' : 'fallback to blurred source',
           },
           {
             id: 'human_parsing',
@@ -1745,7 +2074,19 @@ app.post('/api/items/detect', async (req, res) => {
   }
 })
 
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (_req, res) => {
+  let tryonProbe = null
+  if (tryonSidecarUrl) {
+    try {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 2500)
+      const r = await fetch(`${tryonSidecarUrl}/health`, { signal: ctrl.signal })
+      clearTimeout(t)
+      if (r.ok) tryonProbe = await r.json()
+    } catch {
+      tryonProbe = null
+    }
+  }
   res.json({
     ok: true,
     services: {
@@ -1754,6 +2095,9 @@ app.get('/api/health', (_req, res) => {
       faceDetection: Boolean(faceClient),
       visionSidecar: Boolean(visionSidecarUrl),
       tryonSidecar: Boolean(tryonSidecarUrl),
+      tryoffPipelineReady: tryonProbe?.tryoff_pipeline_ready ?? null,
+      tryoffWarmupError: tryonProbe?.tryoff_warmup_error ?? null,
+      tryoffMode: tryonProbe?.mode ?? null,
       ollama: true,
       serpApiGoogleLens: Boolean(serpApiKey),
     },
@@ -1827,6 +2171,133 @@ app.post('/api/experiments/google-lens', async (req, res) => {
       return res.status(400).json({ error: error.message, code: 'VALIDAATION' })
     }
     res.status(400).json({ error: message, code: 'GOOGLE_LENS_EXPERIMENT' })
+  }
+})
+
+app.post('/api/items/blur-manual', async (req, res) => {
+  try {
+    const body = manualBlurRequestSchema.parse(req.body)
+    const started = Date.now()
+    const buffer = await resolveImageBuffer(body.imageUrl)
+    const meta = await sharp(buffer).metadata()
+    const width = meta.width ?? 0
+    const height = meta.height ?? 0
+    const blur = body.blurAmount && body.blurAmount % 2 === 1 ? body.blurAmount : 35
+    const regions = body.boxes
+      .map((b) => normalizedToPixelRegion(b, width, height))
+      .filter(Boolean)
+    const { output, faceBlurApplied } = await blurFaceRegions(buffer, regions, blur)
+    const filename = `${crypto.randomUUID()}.jpg`
+    await fs.writeFile(path.join(processedDir, filename), output)
+    return res.json({
+      blurredImageUrl: `/storage/processed/${filename}`,
+      faceBlurApplied,
+      regionsCount: regions.length,
+      metadata: {
+        provider: 'server-manual-blur',
+        latency_ms: Date.now() - started,
+        version: '1.0.0',
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Manual blur failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    return res.status(400).json({ error: message })
+  }
+})
+
+async function runTryoffWithBuffer(imageBuffer, garmentTarget = 'outfit', seed = undefined) {
+  const controller = new AbortController()
+  // FLUX try-off on CPU/MPS can exceed 5–20+ minutes; default 2h. Set TRYOFF_TIMEOUT_MS=0 to disable abort.
+  const rawTimeout = process.env.TRYOFF_TIMEOUT_MS ?? process.env.TRYON_TIMEOUT_MS ?? '7200000'
+  const timeoutMs = Number(rawTimeout)
+  const timeoutId =
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const sidecarResponse = await fetch(`${tryonSidecarUrl}/tryoff`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_base64: imageBuffer.toString('base64'),
+        garment_target: garmentTarget,
+        seed,
+      }),
+      signal: controller.signal,
+    })
+    if (!sidecarResponse.ok) {
+      return { implemented: false, message: `Try-off sidecar HTTP ${sidecarResponse.status}`, resultBuffer: null }
+    }
+    const data = await sidecarResponse.json()
+    if (!data?.ok) {
+      return { implemented: false, message: String(data?.error ?? 'Try-off sidecar error'), resultBuffer: null }
+    }
+    if (!data.implemented || !data.result_image_base64) {
+      const msg = [data.message, data.debug_error].filter(Boolean).join(' | ')
+      return { implemented: false, message: String(msg || 'Try-off not configured'), resultBuffer: null }
+    }
+    return {
+      implemented: true,
+      message: null,
+      resultBuffer: Buffer.from(String(data.result_image_base64), 'base64'),
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'tryoff fetch failed'
+    const timedOut =
+      err instanceof Error
+      && (/abort/i.test(message) || message === 'This operation was aborted')
+    const hint = timedOut
+      ? ' (timed out — set TRYOFF_TIMEOUT_MS=0 for no limit, or raise TRYOFF_TIMEOUT_MS in .env)'
+      : ''
+    return {
+      implemented: false,
+      message: `Try-off sidecar unreachable (${tryonSidecarUrl}): ${message}${hint}`,
+      resultBuffer: null,
+    }
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
+
+app.post('/api/items/tryoff', async (req, res) => {
+  try {
+    const body = tryoffRequestSchema.parse(req.body)
+    const started = Date.now()
+    const imageBuf = await resolveImageBuffer(body.imageUrl)
+    const tryoff = await runTryoffWithBuffer(imageBuf, body.garmentTarget, body.seed)
+    if (!tryoff.implemented || !tryoff.resultBuffer) {
+      return res.json({
+        implemented: false,
+        tryoffImageUrl: null,
+        message: String(tryoff.message ?? 'Try-off not configured or model unavailable'),
+        metadata: { provider: 'tryon-sidecar', latency_ms: Date.now() - started, version: '1.0.0' },
+      })
+    }
+
+    const filename = `${crypto.randomUUID()}.jpg`
+    const diskPath = path.join(processedDir, filename)
+    await fs.writeFile(diskPath, tryoff.resultBuffer)
+    console.log(
+      `[tryoff] saved ${diskPath} (${tryoff.resultBuffer.length} bytes, ${Date.now() - started}ms latency)`,
+    )
+    return res.json({
+      implemented: true,
+      tryoffImageUrl: `/storage/processed/${filename}`,
+      message: null,
+      metadata: {
+        provider: 'tryon-sidecar',
+        latency_ms: Date.now() - started,
+        version: '1.0.0',
+        garment_target: body.garmentTarget,
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Try-off failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    res.status(400).json({ error: message })
   }
 })
 
@@ -1907,7 +2378,7 @@ app.post('/api/tryon/preview', async (req, res) => {
 
 app.post('/api/items/preprocess', async (req, res) => {
   try {
-    const { imageUrl, maskPolygon, subjectFilter } = preprocessRequestSchema.parse(req.body)
+    const { imageUrl, maskPolygon, subjectFilter, removeBackground } = preprocessRequestSchema.parse(req.body)
     const started = Date.now()
 
     // Items from /detect are already isolated crops — skip all Vision work.
@@ -2012,10 +2483,13 @@ app.post('/api/items/preprocess', async (req, res) => {
 
     // Track A (worn): blur faces. Track B (flat lay/hanger): skip.
     const regions = rawFaces.map(extractBounds).filter(Boolean)
+    const facesBeforeBlur = regions.length
     const shouldBlurFaces = track === 'worn' && regions.length > 0
     const { output, faceDetected, faceBlurApplied } = shouldBlurFaces
       ? await blurFaceRegions(buffer, regions)
       : { output: buffer, faceDetected: rawFaces.length > 0, faceBlurApplied: false }
+    const residualFaceScan = await detectResidualFaces(output)
+    const needsManualPrivacyReview = residualFaceScan.count > 0
     const garmentBoxes = garmentRegions.map((region) => ({ bbox: normalizedBbox(region.vertices) }))
     const { buffer: subjectFilteredBuffer, warnings: subjectFilterWarnings } =
       await applySubjectFilterToBuffer(output, subjectFilter, personCandidates, garmentBoxes)
@@ -2023,22 +2497,38 @@ app.post('/api/items/preprocess', async (req, res) => {
     // Crop to garment region (if available) to create clean subject for downstream color + inference.
     const garmentRegion = primaryRegion?.vertices ?? await detectGarmentRegion(subjectFilteredBuffer)
     const cropped = await cropToRegion(subjectFilteredBuffer, garmentRegion)
+    const shouldRemoveBackground = typeof removeBackground === 'boolean'
+      ? removeBackground
+      : track === 'flat_lay'
+    const bgAdjusted = shouldRemoveBackground ? await removeBackgroundForGarment(cropped) : cropped
+    // Keep inference payloads small for faster Gemini calls and lower token cost.
+    const optimized = await downscaleImageForInference(bgAdjusted, 1024)
     const filename = `${crypto.randomUUID()}.jpg`
     const filepath = path.join(processedDir, filename)
-    await fs.writeFile(filepath, cropped)
+    await fs.writeFile(filepath, optimized)
     res.json({
       processedImageUrl: `/storage/processed/${filename}`,
       faceDetected,
       faceBlurApplied,
+      facesBeforeBlur,
+      facesAfterBlur: residualFaceScan.count,
+      residualFaceRegions: residualFaceScan.regions,
+      needsManualPrivacyReview,
       personDetected: Math.max(rawFaces.length, Number(sidecar?.person_count ?? 0)) > 0,
       garmentIsolated: Boolean(garmentRegion),
+      backgroundRemoved: shouldRemoveBackground,
       scene_track: track,
       scene: {
         face_count: rawFaces.length,
         garment_coverage: Number(garmentCoverage.toFixed(3)),
       },
       validation: validation.metrics,
-      warnings: [...(validation.warnings ?? []), ...(sceneWarning ? [sceneWarning] : []), ...subjectFilterWarnings],
+      warnings: [
+        ...(validation.warnings ?? []),
+        ...(sceneWarning ? [sceneWarning] : []),
+        ...subjectFilterWarnings,
+        ...(needsManualPrivacyReview ? ['Residual face regions detected; apply manual blur before finalizing.'] : []),
+      ],
       metadata: {
         provider: faceClient ? 'google-vision' : 'sharp-fallback',
         model: faceClient ? 'faceDetection+objectLocalization' : 'none',
@@ -2069,8 +2559,12 @@ app.post('/api/items/preprocess', async (req, res) => {
             },
             {
               id: 'privacy_masking',
-              status: shouldBlurFaces ? 'completed' : 'skipped',
-              detail: shouldBlurFaces ? 'blur faces after scene track' : undefined,
+              status: shouldBlurFaces
+                ? (needsManualPrivacyReview ? 'partial' : 'completed')
+                : 'skipped',
+              detail: shouldBlurFaces
+                ? (needsManualPrivacyReview ? 'auto blur applied; residual faces remain' : 'blur faces after scene track')
+                : undefined,
             },
             {
               id: 'clothing_extraction',
@@ -2090,8 +2584,7 @@ app.post('/api/items/preprocess', async (req, res) => {
 
 app.post('/api/items/infer', async (req, res) => {
   try {
-    if (!genai) return res.status(500).json({ error: 'GEMINI_API_KEY is missing' })
-    const { processedImageUrl } = inferRequestSchema.parse(req.body)
+    const { processedImageUrl, sourceImageStage, forceGemini, skipArbitration } = inferRequestSchema.parse(req.body)
     const started = Date.now()
     const imageResponse = await fetch(
       processedImageUrl.startsWith('http')
@@ -2100,8 +2593,95 @@ app.post('/api/items/infer', async (req, res) => {
     )
     if (!imageResponse.ok) throw new Error('Unable to read processed image')
     const imageBuffer = Buffer.from(await imageResponse.arrayBuffer())
-    const base64Image = imageBuffer.toString('base64')
-    const inferMime = await detectImageMime(imageBuffer)
+
+    // Optional hybrid backend from vision-sidecar (Florence + fashion-SigLIP core).
+    // Modes:
+    // - hybrid_sidecar: require sidecar inference
+    // - auto: try sidecar first, then Gemini pipeline
+    // - gemini: skip sidecar and use Gemini-only path
+    if (!forceGemini && (inferBackend === 'hybrid_sidecar' || inferBackend === 'auto')) {
+      const sidecarInfer = await callVisionSidecarInfer(imageBuffer)
+      if (sidecarInfer) {
+        let out = { ...sidecarInfer }
+        const dbg = sidecarInfer?.metadata?.debug ?? {}
+        const shouldArb =
+          !skipArbitration &&
+          inferArbitrateMode === 'gemini_on_disagreement' &&
+          genai &&
+          dbg.attribute_disagreement === true
+        if (shouldArb) {
+          try {
+            const arbBuf = await downscaleImageForInference(imageBuffer, 768)
+            const arb = await arbitrateHybridDisagreement(arbBuf, sidecarInfer)
+            const prevU = sidecarInfer.uncertainty ?? {}
+            const lowConf = Number(sidecarInfer.confidence_overall ?? 0) < 0.6
+            out = {
+              ...sidecarInfer,
+              item_type: arb.item_type,
+              subtype: arb.item_type,
+              category: arb.category,
+              uncertainty: {
+                ...prevU,
+                attribute_disagreement: false,
+                blocks_embedding: false,
+                requires_user_confirmation: lowConf,
+                uncertain_fields: lowConf ? ['item_type'] : [],
+                arbitration_applied: true,
+              },
+              metadata: {
+                ...(sidecarInfer.metadata ?? {}),
+                debug: {
+                  ...dbg,
+                  gemini_arbitration: { item_type: arb.item_type, category: arb.category },
+                },
+              },
+            }
+          } catch {
+            // Keep original sidecar payload if arbitration fails
+          }
+        }
+        return res.json({
+          ...out,
+          metadata: {
+            ...(out.metadata ?? {}),
+            latency_ms: Date.now() - started,
+            pipeline: {
+              architecture_id: PIPELINE_ARCHITECTURE_ID,
+              stages: [
+                { id: 'image_filtering', status: 'skipped', detail: 'handled in /preprocess' },
+                { id: 'human_detection', status: 'skipped', detail: 'handled in /detect' },
+                { id: 'human_parsing', status: 'completed', detail: 'vision-sidecar hybrid parsing' },
+                { id: 'privacy_masking', status: 'skipped', detail: 'handled in /preprocess' },
+                { id: 'clothing_extraction', status: 'skipped', detail: 'handled in /preprocess' },
+                {
+                  id: 'attribute_inference',
+                  status: 'completed',
+                  detail: 'vision-sidecar Florence + fashion-SigLIP + LAB palette',
+                },
+                { id: 'post_processing', status: 'completed', detail: 'server schema alignment' },
+              ],
+            },
+          },
+        })
+      }
+      if (inferBackend === 'hybrid_sidecar') {
+        return res.status(502).json({
+          error: 'Hybrid sidecar inference unavailable. Check VISION_SIDECAR_URL and sidecar model setup.',
+        })
+      }
+    }
+
+    if (!genai) {
+      const fallback = await fallbackInferFromVision(imageBuffer)
+      return res.json({
+        ...fallback,
+        warning: 'Gemini unavailable and sidecar infer unavailable; heuristic fallback used.',
+      })
+    }
+
+    const inferenceBuffer = await downscaleImageForInference(imageBuffer, 1024)
+    const base64Image = inferenceBuffer.toString('base64')
+    const inferMime = await detectImageMime(inferenceBuffer)
 
     try {
       const quality = await scoreImageQuality(imageBuffer)
@@ -2226,13 +2806,33 @@ Schema:
   "pairings":["string","string","string"],
   "confidence":{"formality":0-1,"occasions":0-1,"style_archetype":0-1,"seasonality":0-1}
 }`
-
-      const semanticModel =
-        process.env.INFER_SEMANTIC_USE_PRO === '1' && useProFirst ? inferProModel : inferFlashModel
-      const semantic = await runGeminiJson(semanticModel, semanticSchema, semanticPrompt, base64Image, {
-        mimeType: inferMime,
-        temperature: 0.35,
-      })
+      const shouldRunSemanticPass =
+        quality.accepted && quality.blur_score >= 0.3 && quality.lighting_score >= 0.3 && quality.occlusion_visible_pct >= 0.35
+      let semantic
+      if (shouldRunSemanticPass) {
+        const semanticModel =
+          process.env.INFER_SEMANTIC_USE_PRO === '1' && useProFirst ? inferProModel : inferFlashModel
+        semantic = await runGeminiJson(semanticModel, semanticSchema, semanticPrompt, base64Image, {
+          mimeType: inferMime,
+          temperature: 0.35,
+        })
+      } else {
+        quality.warnings.push('Skipped deep style/occasion pass due to low image quality or visibility.')
+        semantic = {
+          formality: 5,
+          seasons: { spring: 0.6, summer: 0.6, autumn: 0.6, winter: 0.6 },
+          occasions: ['casual'],
+          style_archetype: 'smart_casual',
+          layering_role: 'standalone',
+          pairings: [],
+          confidence: {
+            formality: 0.45,
+            occasions: 0.42,
+            style_archetype: 0.4,
+            seasonality: 0.45,
+          },
+        }
+      }
 
       const modelColors = [...structural.colors]
         .sort((a, b) => b.coverage_pct - a.coverage_pct)
@@ -2267,7 +2867,20 @@ Schema:
           : shouldTrustVisionPrimary && primaryVision
             ? dedupePalette([primaryVision, ...visionColors, ...modelColors], 3)
             : dedupePalette([...modelColors, ...visionColors], 3)
-      const colors = prioritizeLightNeutralsPrimary(mergedColors.length ? mergedColors : modelColors)
+      let colorsBase = mergedColors.length ? mergedColors : modelColors
+      // For try-off outputs, white background can dominate. If the top color is neutral
+      // and we have a substantial non-neutral candidate, promote the garment-like color.
+      if (sourceImageStage === 'tryoff' && colorsBase.length > 1) {
+        const first = colorsBase[0]
+        const alt = colorsBase.find((c) => !isNeutralHsl(c.hsl) && Number(c.coverage_pct ?? 0) >= 0.1)
+        if (first && isNeutralHsl(first.hsl) && alt) {
+          colorsBase = [alt, ...colorsBase.filter((c) => c !== alt)]
+        }
+      }
+      const shouldPreferLightNeutrals = quality.framing !== 'worn' && sourceImageStage !== 'tryoff'
+      const colors = shouldPreferLightNeutrals
+        ? prioritizeLightNeutralsPrimary(colorsBase)
+        : colorsBase
 
       const seasonEntries = Object.entries(semantic.seasons)
       const season = seasonEntries
@@ -2310,8 +2923,37 @@ Schema:
       const adjustedConfidenceOverall = Number(
         (confidenceOverall * (1 - Math.min(0.2, filterSignature.risk * 0.25))).toFixed(3),
       )
+      const advancedDesignTags = [
+        structural.pattern,
+        structural.fit && structural.fit !== 'unknown' ? structural.fit : null,
+        resolvedGarmentType,
+        structural.subtype,
+        resolvedCategory,
+        structural.material.primary,
+        semantic.style_archetype,
+        semantic.layering_role ?? 'standalone',
+        ...(semantic.occasions ?? []),
+        ...season,
+        ...(Array.isArray(structural.construction_details) ? structural.construction_details : []),
+        ...(colors.slice(0, 3).map((c) => c.name)),
+      ]
+        .map((tag) => String(tag ?? '').trim().toLowerCase())
+        .filter((tag) => tag.length > 1 && tag !== 'unknown')
+        .filter((tag, idx, arr) => arr.indexOf(tag) === idx)
+        .slice(0, 24)
+      const advancedStyleNote = [
+        `style=${semantic.style_archetype}`,
+        `layering=${semantic.layering_role ?? 'standalone'}`,
+        `formality=${semantic.formality}/10`,
+        `material=${structural.material.primary}`,
+        `pattern=${structural.pattern}`,
+        `fit=${structural.fit ?? 'unknown'}`,
+        `season=${season.join('/')}`,
+        `occasions=${(semantic.occasions ?? []).slice(0, 4).join(',') || 'n/a'}`,
+      ].join('; ')
 
       const parsed = inferSchema.parse({
+        schema_version: 2,
         item_type: resolvedGarmentType,
         subtype: structural.subtype,
         category: resolvedCategory,
@@ -2320,6 +2962,7 @@ Schema:
         color_primary_hsl: colors[0]?.hsl ?? hslFromColorName('Taupe'),
         color_secondary_hsl: colors[1]?.hsl,
         color_palette: colors.map(({ confidence, ...c }) => c),
+        dominant_colors: colors.map((c) => c.hex).slice(0, 3),
         pattern: structural.pattern,
         fit: structural.fit && structural.fit !== 'unknown' ? structural.fit : undefined,
         material: structural.material.primary,
@@ -2336,6 +2979,10 @@ Schema:
           requires_user_confirmation: adjustedConfidenceOverall < 0.6 || uncertainFields.length > 0,
           uncertain_fields: [...new Set(uncertainFields)],
         },
+        source_image_stage: sourceImageStage ?? 'blurred_fallback',
+        gemini_style_notes: advancedStyleNote,
+        gemini_design_tags: advancedDesignTags,
+        gemini_brand_like: [],
         quality,
       })
 
@@ -2361,6 +3008,16 @@ Schema:
                 detail: 'tiered Gemini + optional multi-sample + LAB/merge palette',
               },
               {
+                id: 'attribute_detection',
+                status: 'completed',
+                detail: 'OpenCV palette + SigLIP/Fusion signals',
+              },
+              {
+                id: 'gemini_enrichment',
+                status: 'completed',
+                detail: 'design/style/occasion enrichment (advisory)',
+              },
+              {
                 id: 'post_processing',
                 status: 'completed',
                 detail: 'palette merge, uncertainty, contradictions',
@@ -2382,6 +3039,84 @@ Schema:
   }
 })
 
+app.post('/api/items/analyze-advanced-local', async (req, res) => {
+  try {
+    const { imageUrl, context } = advancedLocalRequestSchema.parse(req.body)
+    const started = Date.now()
+    const imageBuffer = await resolveImageBuffer(imageUrl)
+    const inferenceBuffer = await downscaleImageForInference(imageBuffer, 1024)
+    const prompt = `You are a fashion attribute parser. Return strict JSON only.
+Schema:
+{
+  "item_type": "string",
+  "category": "${CATEGORY_ENUM.join('|')}",
+  "color_primary": "string",
+  "material": "string",
+  "pattern": "string",
+  "confidence_overall": 0-1,
+  "design_tags": ["string"],
+  "style_notes": "string",
+  "style_tags": ["string"],
+  "occasions": ["string"]
+}
+Rules:
+- Focus only on the primary garment in frame.
+- Prefer precise garment names (e.g. vest dress, wide leg jeans) over generic terms.
+- If uncertain, keep confidence low and avoid hallucinations.
+- Return valid JSON only.
+Existing context: ${JSON.stringify(context ?? {})}`
+
+    const mlx = await runGemmaMlxVision({
+      imageBuffer: inferenceBuffer,
+      prompt,
+      timeoutMs: Number(process.env.GEMMA_MLX_TIMEOUT_MS ?? 40000),
+    })
+    if (!mlx.ok) {
+      return res.status(503).json({
+        ok: false,
+        error: mlx.error ?? 'Local Gemma MLX unavailable/slow. Try smaller model or warmup.',
+        metadata: {
+          provider: 'gemma-mlx-fallback',
+          model: mlx.model,
+          latency_ms: Date.now() - started,
+          version: '1.0.0',
+        },
+      })
+    }
+
+    const parsed = advancedLocalGemmaSchema.parse(mlx.result)
+    const patch = {
+      ...(parsed.item_type ? { item_type: parsed.item_type.trim() } : {}),
+      ...(parsed.category ? { category: parsed.category } : {}),
+      ...(parsed.color_primary ? { color_primary: parsed.color_primary.trim() } : {}),
+      ...(parsed.material ? { material: parsed.material.trim() } : {}),
+      ...(parsed.pattern ? { pattern: parsed.pattern.trim() } : {}),
+      ...(parsed.style_tags?.length ? { style_tags: parsed.style_tags } : {}),
+      ...(parsed.occasions?.length ? { occasions: parsed.occasions } : {}),
+    }
+
+    return res.json({
+      ok: true,
+      advanced: {
+        patch,
+        confidence_overall: parsed.confidence_overall ?? 0.6,
+        design_tags: parsed.design_tags ?? [],
+        style_notes: parsed.style_notes ?? '',
+        raw: mlx.result,
+      },
+      metadata: {
+        provider: 'gemma-mlx',
+        model: mlx.model,
+        latency_ms: Date.now() - started,
+        version: '1.0.0',
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Local advanced analysis failed'
+    return res.status(400).json({ ok: false, error: message })
+  }
+})
+
 app.post('/api/items/embed', async (req, res) => {
   try {
     if (!genai && !embeddingSidecarUrl) {
@@ -2390,6 +3125,28 @@ app.post('/api/items/embed', async (req, res) => {
     const { item } = embedRequestSchema.parse(req.body)
     const started = Date.now()
     const payload = buildEmbeddingPayloadFromItem(item)
+    const cacheKey = buildEmbeddingCacheKey(item, payload)
+    const existing = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
+    const cached = [...existing].reverse().find((entry) => (
+      entry?.item_id === item.id &&
+      typeof entry?.cache_key === 'string' &&
+      entry.cache_key === cacheKey &&
+      Array.isArray(entry?.vector) &&
+      entry.vector.length > 0
+    ))
+    if (cached) {
+      return res.json({
+        vector_id: cached.id,
+        dimensions: Array.isArray(cached.vector) ? cached.vector.length : 0,
+        metadata: {
+          provider: 'cache',
+          model: cached.model ?? 'cached',
+          latency_ms: Date.now() - started,
+          version: '1.2.0',
+        },
+        cached: true,
+      })
+    }
     let values = []
     let modelUsed = embeddingModel
     let warning
@@ -2443,10 +3200,10 @@ app.post('/api/items/embed', async (req, res) => {
     }
 
     const vectorId = crypto.randomUUID()
-    const existing = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
     existing.push({
       id: vectorId,
       item_id: item.id,
+      cache_key: cacheKey,
       vector: values,
       item_snapshot: {
         item_id: item.id,
@@ -2503,7 +3260,7 @@ app.post('/api/extension/match', async (req, res) => {
     const infer = await fetch(`http://127.0.0.1:${port}/api/items/infer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ processedImageUrl: preprocessJson.processedImageUrl }),
+      body: JSON.stringify({ processedImageUrl: preprocessJson.processedImageUrl, skipArbitration: true }),
     })
     const inferJson = await infer.json()
     if (!infer.ok) {
@@ -2719,6 +3476,14 @@ async function startServer() {
   const server = app.listen(port, () => {
     console.log(`Vestir API running on http://127.0.0.1:${port}`)
   })
+  // Node 18+ defaults requestTimeout to 5m, which kills long routes (e.g. FLUX try-off).
+  try {
+    server.requestTimeout = 0
+  } catch {
+    /* older Node */
+  }
+  server.timeout = 0
+  server.headersTimeout = Math.max(server.headersTimeout ?? 0, 120_000)
 
   await new Promise((resolve, reject) => {
     server.on('close', resolve)

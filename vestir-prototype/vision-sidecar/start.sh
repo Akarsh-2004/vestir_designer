@@ -3,12 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Load repo-level env if present (HF_TOKEN, etc.)
-if [ -f "../.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "../.env"
-  set +a
+# Repo root .env (HF_TOKEN, etc.) then vestir-prototype/.env
+for envfile in "../../.env" "../.env"; do
+  if [ -f "$envfile" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$envfile"
+    set +a
+  fi
+done
+
+if [ -n "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
 
 if [ ! -d ".venv" ]; then

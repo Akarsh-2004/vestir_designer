@@ -16,10 +16,15 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8787',
         changeOrigin: true,
+        // FLUX try-off can run 30–120+ minutes on CPU; avoid dev proxy cutting the connection.
+        timeout: 7_200_000,
+        proxyTimeout: 7_200_000,
       },
       '/storage': {
         target: 'http://127.0.0.1:8787',
         changeOrigin: true,
+        timeout: 7_200_000,
+        proxyTimeout: 7_200_000,
       },
     },
   },

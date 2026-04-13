@@ -5,18 +5,37 @@ function hueDiff(a: number, b: number) {
   return Math.min(diff, 360 - diff)
 }
 
+const BUSY_PATTERNS = new Set(['stripe', 'plaid', 'graphic', 'floral', 'check', 'mixed', 'texture'])
+
+function patternKey(item: Item): string {
+  const p = (item.pattern ?? '').trim().toLowerCase()
+  return p || 'solid'
+}
+
+function patternModifier(anchor: Item, candidate: Item): number {
+  const pa = patternKey(anchor)
+  const pb = patternKey(candidate)
+  const busyA = BUSY_PATTERNS.has(pa)
+  const busyB = BUSY_PATTERNS.has(pb)
+  if (busyA && busyB) return -12
+  if (busyA !== busyB) return 4
+  return 0
+}
+
 function colorScore(anchor: Item, candidate: Item) {
   const satA = anchor.color_primary_hsl.s
   const satB = candidate.color_primary_hsl.s
   const diff = hueDiff(anchor.color_primary_hsl.h, candidate.color_primary_hsl.h)
 
-  if (satA < 0.15 || satB < 0.15) return 38
-  if (diff >= 165 && diff <= 195) return 40
-  if (diff <= 40) return 35
-  if (diff < 15) return 32
-  if (diff >= 110 && diff <= 130) return 30
-  if (diff >= 60 && diff <= 160 && satA > 0.35 && satB > 0.35) return 5
-  return 20
+  let base: number
+  if (satA < 0.15 || satB < 0.15) base = 38
+  else if (diff >= 165 && diff <= 195) base = 40
+  else if (diff <= 40) base = 35
+  else if (diff < 15) base = 32
+  else if (diff >= 110 && diff <= 130) base = 30
+  else if (diff >= 60 && diff <= 160 && satA > 0.35 && satB > 0.35) base = 5
+  else base = 20
+  return base + patternModifier(anchor, candidate)
 }
 
 function formalityScore(anchor: Item, candidate: Item) {
@@ -42,5 +61,7 @@ function seasonScore(anchor: Item, candidate: Item) {
 }
 
 export function calculateCompatibility(anchor: Item, candidate: Item) {
-  return colorScore(anchor, candidate) + formalityScore(anchor, candidate) + seasonScore(anchor, candidate)
+  return (
+    colorScore(anchor, candidate) + formalityScore(anchor, candidate) + seasonScore(anchor, candidate)
+  )
 }

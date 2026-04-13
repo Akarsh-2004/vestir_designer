@@ -2,3 +2,10 @@ fastapi
 uvicorn
 numpy
 pillow
+torch
+diffusers
+peft
+transformers
+accelerate
+safetensors
+huggingface_hub

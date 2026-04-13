@@ -21,6 +21,13 @@ export interface Item {
   material: string
   /** Relaxed / slim / … when inference returns it */
   fit?: string
+  pattern?: string
+  /** Set when models disagreed; embedding skipped until user confirms (see item detail). */
+  attribute_review_pending?: boolean
+  style_tags?: string[]
+  /** Rich tags from SigLIP + controlled vocabulary (optional). */
+  fashion_tags?: string[]
+  occasions?: string[]
   formality: number
   season: string[]
   ai_processed: boolean
@@ -98,6 +105,13 @@ export interface PersonCandidate {
   bbox: NormalizedBBox
 }
 
+export interface FaceCandidate {
+  id: string
+  confidence: number
+  bbox: NormalizedBBox
+  source?: string
+}
+
 export interface PipelineStageInfo {
   id: PipelineStageId
   status: 'completed' | 'skipped' | 'partial'
@@ -107,8 +121,12 @@ export interface PipelineStageInfo {
 export interface DetectionResult {
   detected: DetectedGarment[]
   person_candidates?: PersonCandidate[]
+  face_candidates?: FaceCandidate[]
   scene_track: 'worn' | 'flat_lay' | 'ambiguous'
   source_image_url: string
+  source_image_stage?: 'tryoff' | 'blurred_fallback'
+  auto_blurred_image_url?: string | null
+  manual_blur_required?: boolean
   applied_subject_filter?: SubjectFilterConfig
   /** Server-reported alignment with the multi-stage architecture. */
   pipeline?: {
@@ -127,9 +145,15 @@ export type PipelineStageId =
   | 'image_filtering'
   | 'subject_filtering'
   | 'human_detection'
+  | 'face_detection'
+  | 'auto_blur'
+  | 'manual_blur'
+  | 'tryoff_extraction'
   | 'human_parsing'
   | 'privacy_masking'
   | 'clothing_extraction'
+  | 'attribute_detection'
+  | 'gemini_enrichment'
   | 'attribute_inference'
   | 'post_processing'
 

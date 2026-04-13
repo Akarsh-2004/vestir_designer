@@ -111,6 +111,15 @@ Optional HTTP check (uvicorn running):
 python test_modanet_yolo.py "C:\path\to\photo.jpg" --serve
 ```
 
+## Hybrid infer: LAB palette + masking + fine-tuning policy
+
+- `/infer` clusters garment colors in **OpenCV LAB** space and maps centroids to **`fashion_color_vocab.json`** (CIELAB anchors). Replace anchors by sampling real garment crops per name for production stability.
+- **`VESTIR_COLOR_MASK`**: `none` | `alpha` | `grabcut` | `all` (default **`all`**). `alpha` uses PNG alpha; `grabcut` uses a center-seeded GrabCut mask; `all` combines both when alpha exists.
+- **`FASHION_COLOR_VOCAB_PATH`**: optional override for the JSON path.
+- Do not fine-tune detection/CLIP until you meet the crop-count gate — see **[FINETUNING.md](./FINETUNING.md)**.
+
+On the **Node** API, optional second-pass arbitration when models disagree: set `VESTIR_INFER_ARBITRATE=gemini_on_disagreement` (requires `GEMINI_API_KEY`). The browser extension calls infer with `skipArbitration: true` so match stays fast.
+
 ## Response shape
 
 ```json

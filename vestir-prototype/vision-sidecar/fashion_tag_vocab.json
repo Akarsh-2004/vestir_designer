@@ -1,0 +1,1045 @@
+{
+  "version": 1,
+  "tags": [
+    {
+      "layer": "garment",
+      "id": "oversized_tee",
+      "embed": "oversized t-shirt boxy casual top"
+    },
+    {
+      "layer": "garment",
+      "id": "cropped_hoodie",
+      "embed": "cropped hoodie sweatshirt"
+    },
+    {
+      "layer": "garment",
+      "id": "cargo_pants",
+      "embed": "cargo pants utility pockets"
+    },
+    {
+      "layer": "garment",
+      "id": "trench_coat",
+      "embed": "trench coat long belted outerwear"
+    },
+    {
+      "layer": "garment",
+      "id": "coord_set",
+      "embed": "matching co-ord set two piece outfit"
+    },
+    {
+      "layer": "garment",
+      "id": "blazer_jacket",
+      "embed": "tailored blazer jacket structured"
+    },
+    {
+      "layer": "garment",
+      "id": "denim_jacket",
+      "embed": "denim jacket trucker jean jacket"
+    },
+    {
+      "layer": "garment",
+      "id": "midi_skirt",
+      "embed": "midi length skirt"
+    },
+    {
+      "layer": "garment",
+      "id": "maxi_dress",
+      "embed": "maxi dress long flowing dress"
+    },
+    {
+      "layer": "garment",
+      "id": "slip_dress",
+      "embed": "slip dress satin minimal"
+    },
+    {
+      "layer": "garment",
+      "id": "polo_shirt",
+      "embed": "polo shirt collar knit"
+    },
+    {
+      "layer": "garment",
+      "id": "tank_top",
+      "embed": "tank top sleeveless"
+    },
+    {
+      "layer": "garment",
+      "id": "cardigan",
+      "embed": "cardigan knit layered"
+    },
+    {
+      "layer": "garment",
+      "id": "bomber_jacket",
+      "embed": "bomber jacket ribbed cuffs"
+    },
+    {
+      "layer": "garment",
+      "id": "windbreaker",
+      "embed": "windbreaker shell jacket"
+    },
+    {
+      "layer": "garment",
+      "id": "leggings",
+      "embed": "leggings stretch athletic"
+    },
+    {
+      "layer": "garment",
+      "id": "wide_leg_pants",
+      "embed": "wide leg trousers flowy"
+    },
+    {
+      "layer": "garment",
+      "id": "culottes",
+      "embed": "culottes cropped wide pants"
+    },
+    {
+      "layer": "garment",
+      "id": "romper",
+      "embed": "romper jumpsuit shorts"
+    },
+    {
+      "layer": "garment",
+      "id": "bodysuit",
+      "embed": "bodysuit fitted one piece"
+    },
+    {
+      "layer": "color_base",
+      "id": "black",
+      "embed": "black monochrome dark garment"
+    },
+    {
+      "layer": "color_base",
+      "id": "ivory",
+      "embed": "ivory off-white cream garment"
+    },
+    {
+      "layer": "color_base",
+      "id": "charcoal",
+      "embed": "charcoal gray deep neutral"
+    },
+    {
+      "layer": "color_base",
+      "id": "navy",
+      "embed": "navy blue deep blue clothing"
+    },
+    {
+      "layer": "color_base",
+      "id": "camel",
+      "embed": "camel tan brown neutral coat"
+    },
+    {
+      "layer": "color_base",
+      "id": "burgundy",
+      "embed": "burgundy wine red garment"
+    },
+    {
+      "layer": "color_base",
+      "id": "sage_green",
+      "embed": "sage muted green clothing"
+    },
+    {
+      "layer": "color_base",
+      "id": "rust",
+      "embed": "rust terracotta orange brown"
+    },
+    {
+      "layer": "color_tone",
+      "id": "muted_tones",
+      "embed": "muted desaturated soft colors"
+    },
+    {
+      "layer": "color_tone",
+      "id": "pastel_palette",
+      "embed": "pastel light candy colors"
+    },
+    {
+      "layer": "color_tone",
+      "id": "neon_accent",
+      "embed": "neon bright pop color"
+    },
+    {
+      "layer": "color_tone",
+      "id": "earthy_neutral",
+      "embed": "earthy natural brown green tones"
+    },
+    {
+      "layer": "color_tone",
+      "id": "monochrome_fit",
+      "embed": "monochrome single color outfit"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "color_blocked",
+      "embed": "color blocked panels contrast"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "gradient_fade",
+      "embed": "gradient ombre color fade"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "washed_faded",
+      "embed": "washed faded vintage dye"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "striped",
+      "embed": "striped pattern lines"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "plaid_check",
+      "embed": "plaid check tartan pattern"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "animal_print",
+      "embed": "animal print leopard zebra"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "floral_print",
+      "embed": "floral botanical print"
+    },
+    {
+      "layer": "fabric",
+      "id": "denim_fabric",
+      "embed": "denim jeans twill fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "corduroy",
+      "embed": "corduroy ribbed velvet"
+    },
+    {
+      "layer": "fabric",
+      "id": "linen_weave",
+      "embed": "linen breathable summer fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "ribbed_knit",
+      "embed": "ribbed cotton knit texture"
+    },
+    {
+      "layer": "fabric",
+      "id": "satin_sheen",
+      "embed": "satin silky shiny fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "chiffon_light",
+      "embed": "chiffon sheer lightweight fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "leather_piece",
+      "embed": "leather garment texture"
+    },
+    {
+      "layer": "fabric",
+      "id": "fleece_soft",
+      "embed": "fleece soft cozy fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "mesh_athletic",
+      "embed": "mesh athletic breathable"
+    },
+    {
+      "layer": "fabric",
+      "id": "wool_knit",
+      "embed": "wool knit warm sweater"
+    },
+    {
+      "layer": "fit",
+      "id": "slim_fit",
+      "embed": "slim fit tailored close silhouette"
+    },
+    {
+      "layer": "fit",
+      "id": "boxy_fit",
+      "embed": "boxy square silhouette"
+    },
+    {
+      "layer": "fit",
+      "id": "oversized_silhouette",
+      "embed": "oversized loose voluminous fit"
+    },
+    {
+      "layer": "fit",
+      "id": "relaxed_fit",
+      "embed": "relaxed comfortable easy fit"
+    },
+    {
+      "layer": "fit",
+      "id": "tailored_cut",
+      "embed": "tailored structured sharp fit"
+    },
+    {
+      "layer": "fit",
+      "id": "tapered_leg",
+      "embed": "tapered narrow ankle pants"
+    },
+    {
+      "layer": "fit",
+      "id": "dropped_shoulder",
+      "embed": "dropped shoulder seam relaxed"
+    },
+    {
+      "layer": "fit",
+      "id": "high_waist",
+      "embed": "high waist rise pants skirt"
+    },
+    {
+      "layer": "fit",
+      "id": "cropped_length",
+      "embed": "cropped short length hem"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "streetwear",
+      "embed": "streetwear urban hype style"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "minimal_style",
+      "embed": "minimal clean quiet luxury"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "techwear",
+      "embed": "techwear utilitarian straps technical"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "avant_garde",
+      "embed": "avant-garde experimental fashion"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "old_money",
+      "embed": "old money quiet classic wealth"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "y2k_revival",
+      "embed": "Y2K early 2000s fashion"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "grunge_aesthetic",
+      "embed": "grunge distressed alternative"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "korean_core",
+      "embed": "Korean fashion clean layered"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "dark_academia",
+      "embed": "dark academia scholarly vintage"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "clean_girl",
+      "embed": "clean girl polished minimal"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "normcore",
+      "embed": "normcore basic understated"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "gorpcore",
+      "embed": "gorpcore outdoor hiking fashion"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "coquette",
+      "embed": "coquette feminine bows soft"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "scandi_minimal",
+      "embed": "Scandinavian minimal neutral"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "parisian_chic",
+      "embed": "Parisian chic effortless"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "athleisure_look",
+      "embed": "athleisure sporty casual"
+    },
+    {
+      "layer": "details",
+      "id": "distressed_detail",
+      "embed": "distressed ripped worn details"
+    },
+    {
+      "layer": "details",
+      "id": "embroidered",
+      "embed": "embroidered stitched motif"
+    },
+    {
+      "layer": "details",
+      "id": "pleated",
+      "embed": "pleated folds skirt dress"
+    },
+    {
+      "layer": "details",
+      "id": "layered_look",
+      "embed": "layered styling multiple pieces"
+    },
+    {
+      "layer": "details",
+      "id": "ruched_texture",
+      "embed": "ruched gathered fabric"
+    },
+    {
+      "layer": "details",
+      "id": "asymmetrical_cut",
+      "embed": "asymmetrical hem neckline"
+    },
+    {
+      "layer": "details",
+      "id": "zipper_accents",
+      "embed": "zipper hardware accents"
+    },
+    {
+      "layer": "details",
+      "id": "utility_pockets",
+      "embed": "utility cargo pockets"
+    },
+    {
+      "layer": "details",
+      "id": "drawstring_waist",
+      "embed": "drawstring waist cinch"
+    },
+    {
+      "layer": "details",
+      "id": "lace_trim",
+      "embed": "lace trim delicate detail"
+    },
+    {
+      "layer": "details",
+      "id": "quilted",
+      "embed": "quilted padded stitching"
+    },
+    {
+      "layer": "occasion",
+      "id": "casual_everyday",
+      "embed": "casual everyday wear"
+    },
+    {
+      "layer": "occasion",
+      "id": "formal_attire",
+      "embed": "formal dressy occasion"
+    },
+    {
+      "layer": "occasion",
+      "id": "office_workwear",
+      "embed": "office professional workwear"
+    },
+    {
+      "layer": "occasion",
+      "id": "party_night_out",
+      "embed": "party night out statement"
+    },
+    {
+      "layer": "occasion",
+      "id": "travel_comfort",
+      "embed": "travel comfortable practical"
+    },
+    {
+      "layer": "occasion",
+      "id": "lounge_relaxed",
+      "embed": "lounge relaxed home"
+    },
+    {
+      "layer": "occasion",
+      "id": "date_night",
+      "embed": "date night polished outfit"
+    },
+    {
+      "layer": "occasion",
+      "id": "festival_wear",
+      "embed": "festival bold playful"
+    },
+    {
+      "layer": "season",
+      "id": "summer_heat",
+      "embed": "summer hot weather outfit"
+    },
+    {
+      "layer": "season",
+      "id": "winter_cold",
+      "embed": "winter cold weather layers"
+    },
+    {
+      "layer": "season",
+      "id": "transitional_season",
+      "embed": "transitional spring fall layering"
+    },
+    {
+      "layer": "season",
+      "id": "all_season_basic",
+      "embed": "all season versatile staple"
+    },
+    {
+      "layer": "styling",
+      "id": "pairs_with_sneakers",
+      "embed": "styled with sneakers footwear"
+    },
+    {
+      "layer": "styling",
+      "id": "pairs_with_boots",
+      "embed": "styled with boots footwear"
+    },
+    {
+      "layer": "styling",
+      "id": "pairs_with_loafers",
+      "embed": "styled with loafers dress shoes"
+    },
+    {
+      "layer": "styling",
+      "id": "layering_friendly",
+      "embed": "layering friendly versatile base"
+    },
+    {
+      "layer": "styling",
+      "id": "statement_piece",
+      "embed": "bold statement centerpiece garment"
+    },
+    {
+      "layer": "styling",
+      "id": "wardrobe_basic",
+      "embed": "basic wardrobe essential staple"
+    },
+    {
+      "layer": "styling",
+      "id": "monochrome_styling",
+      "embed": "monochrome tonal styling"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "menswear_leaning",
+      "embed": "menswear masculine tailoring"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "womenswear_leaning",
+      "embed": "womenswear feminine silhouette"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "unisex_style",
+      "embed": "unisex gender neutral clothing"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "androgynous_look",
+      "embed": "androgynous mixed gender styling"
+    },
+    {
+      "layer": "context",
+      "id": "vibe_edgy",
+      "embed": "edgy bold attitude"
+    },
+    {
+      "layer": "context",
+      "id": "vibe_soft",
+      "embed": "soft gentle romantic vibe"
+    },
+    {
+      "layer": "context",
+      "id": "vibe_elegant",
+      "embed": "elegant refined vibe"
+    },
+    {
+      "layer": "context",
+      "id": "era_90s",
+      "embed": "1990s inspired fashion"
+    },
+    {
+      "layer": "context",
+      "id": "era_modern",
+      "embed": "contemporary modern fashion"
+    },
+    {
+      "layer": "context",
+      "id": "instagram_core",
+      "embed": "instagram influencer aesthetic"
+    },
+    {
+      "layer": "context",
+      "id": "runway_inspired",
+      "embed": "runway inspired high fashion"
+    },
+    {
+      "layer": "context",
+      "id": "korean_street",
+      "embed": "Korean street style"
+    },
+    {
+      "layer": "garment",
+      "id": "peacoat",
+      "embed": "peacoat double breasted wool coat"
+    },
+    {
+      "layer": "garment",
+      "id": "parka",
+      "embed": "parka hooded winter coat"
+    },
+    {
+      "layer": "garment",
+      "id": "anorak",
+      "embed": "anorak pullover jacket"
+    },
+    {
+      "layer": "garment",
+      "id": "kimono_layer",
+      "embed": "kimono wrap layer"
+    },
+    {
+      "layer": "garment",
+      "id": "tube_top",
+      "embed": "tube top strapless"
+    },
+    {
+      "layer": "garment",
+      "id": "crop_top",
+      "embed": "crop top short hem"
+    },
+    {
+      "layer": "garment",
+      "id": "henley_shirt",
+      "embed": "henley button placket shirt"
+    },
+    {
+      "layer": "garment",
+      "id": "oxford_shirt",
+      "embed": "oxford button down shirt"
+    },
+    {
+      "layer": "garment",
+      "id": "chinos",
+      "embed": "chino pants cotton twill"
+    },
+    {
+      "layer": "garment",
+      "id": "joggers",
+      "embed": "jogger sweatpants tapered"
+    },
+    {
+      "layer": "garment",
+      "id": "suit_trousers",
+      "embed": "dress trousers suit pants"
+    },
+    {
+      "layer": "garment",
+      "id": "pleated_skirt",
+      "embed": "pleated skirt school style"
+    },
+    {
+      "layer": "garment",
+      "id": "pencil_skirt",
+      "embed": "pencil skirt fitted"
+    },
+    {
+      "layer": "garment",
+      "id": "shift_dress",
+      "embed": "shift dress straight silhouette"
+    },
+    {
+      "layer": "garment",
+      "id": "wrap_dress",
+      "embed": "wrap dress tied waist"
+    },
+    {
+      "layer": "garment",
+      "id": "tunic_top",
+      "embed": "tunic longline top"
+    },
+    {
+      "layer": "garment",
+      "id": "shacket",
+      "embed": "shacket shirt jacket hybrid"
+    },
+    {
+      "layer": "garment",
+      "id": "puffer_coat",
+      "embed": "puffer quilted down coat"
+    },
+    {
+      "layer": "garment",
+      "id": "varsity_jacket",
+      "embed": "varsity jacket collegiate"
+    },
+    {
+      "layer": "garment",
+      "id": "denim_shorts",
+      "embed": "denim shorts cutoffs"
+    },
+    {
+      "layer": "garment",
+      "id": "bike_shorts",
+      "embed": "bike shorts athletic short"
+    },
+    {
+      "layer": "garment",
+      "id": "sarong_wrap",
+      "embed": "sarong wrap skirt beach"
+    },
+    {
+      "layer": "color_base",
+      "id": "white",
+      "embed": "bright white garment"
+    },
+    {
+      "layer": "color_base",
+      "id": "cream",
+      "embed": "cream warm white"
+    },
+    {
+      "layer": "color_base",
+      "id": "chocolate_brown",
+      "embed": "chocolate brown deep brown"
+    },
+    {
+      "layer": "color_base",
+      "id": "olive_green",
+      "embed": "olive green military tone"
+    },
+    {
+      "layer": "color_base",
+      "id": "lilac",
+      "embed": "lilac soft purple"
+    },
+    {
+      "layer": "color_tone",
+      "id": "high_contrast",
+      "embed": "high contrast bold colors"
+    },
+    {
+      "layer": "color_tone",
+      "id": "tonal_harmony",
+      "embed": "tonal harmonious shades"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "houndstooth",
+      "embed": "houndstooth small check pattern"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "paisley",
+      "embed": "paisley ornate print"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "tie_dye",
+      "embed": "tie dye spiral pattern"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "camo_print",
+      "embed": "camouflage print pattern"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "polka_dot",
+      "embed": "polka dot spotted pattern"
+    },
+    {
+      "layer": "fabric",
+      "id": "tweed",
+      "embed": "tweed textured wool blend"
+    },
+    {
+      "layer": "fabric",
+      "id": "velvet",
+      "embed": "velvet plush fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "canvas_cotton",
+      "embed": "canvas sturdy cotton"
+    },
+    {
+      "layer": "fabric",
+      "id": "silk_charmeuse",
+      "embed": "silk charmeuse fluid"
+    },
+    {
+      "layer": "fabric",
+      "id": "terry_cloth",
+      "embed": "terry towel texture"
+    },
+    {
+      "layer": "fabric",
+      "id": "neoprene",
+      "embed": "neoprene scuba fabric"
+    },
+    {
+      "layer": "fabric",
+      "id": "shearling_trim",
+      "embed": "shearling fuzzy trim"
+    },
+    {
+      "layer": "fit",
+      "id": "structured_shoulders",
+      "embed": "structured padded shoulders"
+    },
+    {
+      "layer": "fit",
+      "id": "bodycon",
+      "embed": "bodycon tight fitted dress"
+    },
+    {
+      "layer": "fit",
+      "id": "a_line_cut",
+      "embed": "A-line flared silhouette"
+    },
+    {
+      "layer": "fit",
+      "id": "straight_leg",
+      "embed": "straight leg pants"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "workwear",
+      "embed": "workwear utilitarian blue collar"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "cottagecore",
+      "embed": "cottagecore pastoral romantic"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "boho",
+      "embed": "bohemian flowy eclectic"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "preppy",
+      "embed": "preppy ivy league classic"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "punk_inspired",
+      "embed": "punk inspired rebellious"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "retro_sport",
+      "embed": "retro sport vintage athletic"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "quiet_luxury",
+      "embed": "quiet luxury stealth wealth"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "coastal_grandmother",
+      "embed": "coastal relaxed linen aesthetic"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "indie_sleaze",
+      "embed": "indie sleaze early 2000s grit"
+    },
+    {
+      "layer": "details",
+      "id": "patchwork",
+      "embed": "patchwork mixed panels"
+    },
+    {
+      "layer": "details",
+      "id": "fringe_trim",
+      "embed": "fringe trim movement"
+    },
+    {
+      "layer": "details",
+      "id": "cut_outs",
+      "embed": "strategic cut outs skin"
+    },
+    {
+      "layer": "details",
+      "id": "sequin",
+      "embed": "sequin sparkle embellishment"
+    },
+    {
+      "layer": "details",
+      "id": "stud_hardware",
+      "embed": "metal studs hardware"
+    },
+    {
+      "layer": "details",
+      "id": "contrast_stitch",
+      "embed": "contrast stitching detail"
+    },
+    {
+      "layer": "occasion",
+      "id": "athletic_gym",
+      "embed": "gym athletic workout"
+    },
+    {
+      "layer": "occasion",
+      "id": "brunch_casual",
+      "embed": "brunch daytime casual"
+    },
+    {
+      "layer": "occasion",
+      "id": "black_tie_adjacent",
+      "embed": "black tie formal evening"
+    },
+    {
+      "layer": "season",
+      "id": "rain_ready",
+      "embed": "rain ready water resistant"
+    },
+    {
+      "layer": "styling",
+      "id": "pairs_with_heels",
+      "embed": "styled with heels footwear"
+    },
+    {
+      "layer": "styling",
+      "id": "pairs_with_sandals",
+      "embed": "styled with sandals summer"
+    },
+    {
+      "layer": "styling",
+      "id": "belted_waist",
+      "embed": "belted waist definition"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "femme_presenting",
+      "embed": "femme presenting styling"
+    },
+    {
+      "layer": "gender_expression",
+      "id": "masc_presenting",
+      "embed": "masc presenting styling"
+    },
+    {
+      "layer": "context",
+      "id": "vibe_bold",
+      "embed": "bold confident statement"
+    },
+    {
+      "layer": "context",
+      "id": "vibe_minimal",
+      "embed": "minimal restrained mood"
+    },
+    {
+      "layer": "context",
+      "id": "era_y2k",
+      "embed": "Y2K futuristic metallic"
+    },
+    {
+      "layer": "context",
+      "id": "era_80s",
+      "embed": "1980s inspired volume"
+    },
+    {
+      "layer": "context",
+      "id": "tokyo_street",
+      "embed": "Tokyo street fashion"
+    },
+    {
+      "layer": "context",
+      "id": "nyc_downtown",
+      "embed": "New York downtown street"
+    },
+    {
+      "layer": "garment",
+      "id": "mock_neck",
+      "embed": "mock neck fitted collar"
+    },
+    {
+      "layer": "garment",
+      "id": "turtleneck",
+      "embed": "turtleneck high neck knit"
+    },
+    {
+      "layer": "garment",
+      "id": "duster_coat",
+      "embed": "duster long lightweight coat"
+    },
+    {
+      "layer": "garment",
+      "id": "cape_layer",
+      "embed": "cape outer layer dramatic"
+    },
+    {
+      "layer": "fabric",
+      "id": "cashmere_soft",
+      "embed": "cashmere soft luxury knit"
+    },
+    {
+      "layer": "fabric",
+      "id": "boucle",
+      "embed": "boucle nubby tweed knit"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "western",
+      "embed": "western cowboy inspired"
+    },
+    {
+      "layer": "aesthetic",
+      "id": "military_inspired",
+      "embed": "military inspired utilitarian"
+    },
+    {
+      "layer": "details",
+      "id": "smocking",
+      "embed": "smocked gathered elastic"
+    },
+    {
+      "layer": "details",
+      "id": "peplum_hem",
+      "embed": "peplum flared waist"
+    },
+    {
+      "layer": "fit",
+      "id": "low_rise",
+      "embed": "low rise waist pants"
+    },
+    {
+      "layer": "fit",
+      "id": "wide_shoulder",
+      "embed": "wide shoulder power silhouette"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "abstract_print",
+      "embed": "abstract artistic print"
+    },
+    {
+      "layer": "pattern_color",
+      "id": "logo_heavy",
+      "embed": "large logo branding print"
+    },
+    {
+      "layer": "styling",
+      "id": "neck_scarf",
+      "embed": "neck scarf accessory styling"
+    },
+    {
+      "layer": "context",
+      "id": "editorial_shoot",
+      "embed": "editorial fashion photography look"
+    }
+  ]
+}

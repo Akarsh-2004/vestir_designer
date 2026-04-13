@@ -1,7 +1,19 @@
 import type { EmbeddingResult, InferenceResult, PipelineAdapters, PreprocessResult, ReasoningResult } from './contracts'
-import type { DetectionResult, Item, SubjectFilterConfig } from '../../types/index'
+import type { DetectionResult, Item, NormalizedBBox, SubjectFilterConfig } from '../../types/index'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
+
+async function readJsonOrThrow(response: Response, fallbackMessage: string) {
+  const text = await response.text()
+  if (!text) {
+    throw new Error(`${fallbackMessage}: empty response body`)
+  }
+  try {
+    return JSON.parse(text) as Record<string, unknown>
+  } catch {
+    throw new Error(`${fallbackMessage}: non-JSON response`)
+  }
+}
 
 export async function detectItemsFromImage(imageUrl: string, subjectFilter?: SubjectFilterConfig): Promise<DetectionResult> {
   const response = await fetch(`${API_BASE}/api/items/detect`, {
@@ -9,9 +21,76 @@ export async function detectItemsFromImage(imageUrl: string, subjectFilter?: Sub
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ imageUrl, subjectFilter }),
   })
-  const data = await response.json()
-  if (!response.ok) throw new Error(data.error ?? 'Detection failed')
+  const data = await readJsonOrThrow(response, 'Detection request failed')
+  if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : 'Detection failed')
   return data as DetectionResult
+}
+
+export type TryoffExtractionResult = {
+  implemented: boolean
+  tryoffImageUrl: string | null
+  message?: string | null
+}
+
+export type ManualBlurResult = {
+  blurredImageUrl: string | null
+  faceBlurApplied: boolean
+  regionsCount: number
+}
+
+/** Virtual try-off: worn photo → garment on white (FLUX + LoRA). Used before /detect when enabled. */
+export type TryoffGarmentTarget =
+  | 'outfit'
+  | 'ensemble'
+  | 'tshirt'
+  | 'shirt'
+  | 'dress'
+  | 'pants'
+  | 'jacket'
+
+export async function runTryoffExtraction(
+  imageUrl: string,
+  garmentTarget: TryoffGarmentTarget = 'outfit',
+): Promise<TryoffExtractionResult> {
+  const mappedTarget = garmentTarget === 'shirt' ? 'tshirt' : garmentTarget
+  const response = await fetch(`${API_BASE}/api/items/tryoff`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, garmentTarget: mappedTarget }),
+  })
+  const data = await readJsonOrThrow(response, 'Try-off request failed')
+  if (!response.ok) {
+    return {
+      implemented: false,
+      tryoffImageUrl: null,
+      message: typeof data.error === 'string' ? data.error : 'Try-off request failed',
+    }
+  }
+  return {
+    implemented: Boolean(data.implemented),
+    tryoffImageUrl: typeof data.tryoffImageUrl === 'string' ? data.tryoffImageUrl : null,
+    message: data.message ?? null,
+  }
+}
+
+export async function applyManualBlur(
+  imageUrl: string,
+  boxes: NormalizedBBox[],
+): Promise<ManualBlurResult> {
+  const response = await fetch(`${API_BASE}/api/items/blur-manual`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, boxes }),
+  })
+  const data = await readJsonOrThrow(response, 'Manual blur request failed')
+  if (!response.ok) {
+    throw new Error(typeof data.error === 'string' ? data.error : 'Manual blur request failed')
+  }
+  return {
+    blurredImageUrl: typeof data.blurredImageUrl === 'string' ? data.blurredImageUrl : null,
+    faceBlurApplied: Boolean(data.faceBlurApplied),
+    regionsCount: Number(data.regionsCount ?? 0),
+  }
 }
 
 function canonicalizeColor(value?: string) {
@@ -27,15 +106,80 @@ function canonicalizeColor(value?: string) {
   return value
 }
 
+const CATEGORY_CANONICAL: Record<string, Item['category']> = {
+  tops: 'Tops',
+  top: 'Tops',
+  shirts: 'Tops',
+  bottoms: 'Bottoms',
+  bottom: 'Bottoms',
+  pants: 'Bottoms',
+  trousers: 'Bottoms',
+  outerwear: 'Outerwear',
+  shoes: 'Shoes',
+  shoe: 'Shoes',
+  footwear: 'Shoes',
+  accessories: 'Accessories',
+  accessory: 'Accessories',
+}
+
+function toTitleCase(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ')
+}
+
+function normalizeCategory(value: string): Item['category'] {
+  const key = value.trim().toLowerCase()
+  return CATEGORY_CANONICAL[key] ?? 'Tops'
+}
+
+function normalizeSeason(season: InferenceResult['season']) {
+  const allowed = new Set(['spring', 'summer', 'autumn', 'winter'])
+  const normalized = season
+    .map((s) => s.trim().toLowerCase())
+    .filter((s): s is 'spring' | 'summer' | 'autumn' | 'winter' => allowed.has(s))
+  return normalized.length ? normalized : ['spring', 'summer']
+}
+
+function normalizeFit(fit?: string) {
+  if (!fit?.trim()) return undefined
+  const key = fit.trim().toLowerCase()
+  if (key.includes('oversized') || key.includes('oversize')) return 'Oversized'
+  if (key.includes('slim')) return 'Slim'
+  if (key.includes('relaxed')) return 'Relaxed'
+  if (key.includes('regular') || key.includes('classic')) return 'Regular'
+  return toTitleCase(fit)
+}
+
+function normalizeMaterial(material: string) {
+  const key = material.trim().toLowerCase()
+  if (key.includes('denim')) return 'Denim'
+  if (key.includes('cotton')) return 'Cotton'
+  if (key.includes('wool') || key.includes('cashmere')) return 'Wool'
+  if (key.includes('leather')) return 'Leather'
+  if (key.includes('suede')) return 'Suede'
+  if (key.includes('linen')) return 'Linen'
+  if (key.includes('silk')) return 'Silk'
+  return toTitleCase(material || 'Unknown')
+}
+
+function normalizeItemType(raw: InferenceResult): string {
+  const source = raw.subtype?.trim() || raw.item_type?.trim()
+  if (!source) return 'Garment'
+  return toTitleCase(source.replace(/[_-]+/g, ' '))
+}
+
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  const data = await response.json()
+  const data = await readJsonOrThrow(response, `Request failed: ${path}`)
   if (!response.ok) {
-    throw new Error(data.error ?? `Request failed: ${path}`)
+    throw new Error(typeof data.error === 'string' ? data.error : `Request failed: ${path}`)
   }
   return data as T
 }
@@ -45,24 +189,100 @@ export const localPreprocessAdapter = async (imageUrl: string, subjectFilter?: S
 }
 
 export const geminiInferenceAdapter = async (processedImageUrl: string): Promise<InferenceResult> => {
+  // Main pipeline: prefer server-configured backend (auto/hybrid sidecar first).
   return postJson<InferenceResult>('/api/items/infer', { processedImageUrl })
 }
 
+export const advancedGeminiInferenceAdapter = async (processedImageUrl: string): Promise<InferenceResult> => {
+  return postJson<InferenceResult>('/api/items/infer', { processedImageUrl, forceGemini: true })
+}
+
+export type AdvancedLocalAnalysisResult = {
+  ok: boolean
+  advanced?: {
+    patch: Partial<Item>
+    confidence_overall: number
+    design_tags: string[]
+    style_notes: string
+    raw: Record<string, unknown>
+  }
+  metadata?: {
+    provider: string
+    model: string
+    latency_ms: number
+    version: string
+  }
+  error?: string
+}
+
+export const advancedLocalAnalysisAdapter = async (
+  imageUrl: string,
+  context?: Partial<Item>,
+): Promise<AdvancedLocalAnalysisResult> => {
+  return postJson<AdvancedLocalAnalysisResult>('/api/items/analyze-advanced-local', { imageUrl, context })
+}
+
 export const normalizeAttributesAdapter = async (raw: InferenceResult): Promise<Partial<Item>> => {
-  const normalizedSeason = raw.season.length ? raw.season : ['spring', 'summer']
+  const normalizedSeason = normalizeSeason(raw.season)
   const normalizedFormality = Math.max(1, Math.min(10, raw.formality || 5))
+  const normalizedCategory = normalizeCategory(raw.category)
+  const normalizedItemType = normalizeItemType(raw)
+  const normalizedFit = normalizeFit(raw.fit)
+  const normalizedMaterial = normalizeMaterial(raw.material)
+  const styleTags = raw.style_archetype ? [toTitleCase(raw.style_archetype)] : []
+  const fashionPretty = (raw.fashion_tags ?? []).map((t) => toTitleCase(t.replace(/_/g, ' ')))
+  const mergedStyleTags = [...styleTags]
+  for (const ft of fashionPretty) {
+    if (!mergedStyleTags.some((s) => s.toLowerCase() === ft.toLowerCase())) {
+      mergedStyleTags.push(ft)
+    }
+  }
+  const occasions = (raw.occasions ?? []).map((o) => toTitleCase(o))
+  const normalizedPattern = raw.pattern ? toTitleCase(raw.pattern.replace(/_/g, ' ')) : undefined
+  const normalizedRaw = {
+    ...raw,
+    item_type: normalizedItemType,
+    category: normalizedCategory,
+    fit: normalizedFit,
+    material: normalizedMaterial,
+    color_primary: canonicalizeColor(raw.color_primary) ?? 'Taupe',
+    color_secondary: canonicalizeColor(raw.color_secondary),
+    season: normalizedSeason,
+    style_tags: mergedStyleTags.slice(0, 32),
+    fashion_tags: raw.fashion_tags,
+    fashion_descriptor: raw.fashion_descriptor,
+    occasions,
+    pattern: normalizedPattern,
+    label_quality: {
+      confidence_overall: raw.confidence_overall,
+      material_confidence: raw.material_confidence,
+      uncertainty: raw.uncertainty,
+      quality: raw.quality,
+    },
+    canonical: {
+      item_type_key: normalizedItemType.toLowerCase().replace(/\s+/g, '_'),
+      category_key: normalizedCategory.toLowerCase(),
+      primary_color_key: (canonicalizeColor(raw.color_primary) ?? 'Taupe').toLowerCase(),
+      material_key: normalizedMaterial.toLowerCase(),
+      fit_key: normalizedFit?.toLowerCase() ?? null,
+    },
+  }
   return {
-    item_type: raw.item_type.trim(),
-    category: raw.category,
-    ...(raw.fit ? { fit: raw.fit } : {}),
+    item_type: normalizedItemType,
+    category: normalizedCategory,
+    ...(normalizedFit ? { fit: normalizedFit } : {}),
+    ...(normalizedPattern ? { pattern: normalizedPattern } : {}),
+    ...(mergedStyleTags.length ? { style_tags: mergedStyleTags.slice(0, 32) } : {}),
+    ...(raw.fashion_tags?.length ? { fashion_tags: raw.fashion_tags } : {}),
+    ...(occasions.length ? { occasions } : {}),
     color_primary: canonicalizeColor(raw.color_primary) ?? 'Taupe',
     color_secondary: canonicalizeColor(raw.color_secondary),
     color_primary_hsl: raw.color_primary_hsl,
     color_secondary_hsl: raw.color_secondary_hsl,
-    material: raw.material,
+    material: normalizedMaterial,
     formality: normalizedFormality,
     season: normalizedSeason,
-    raw_attributes: JSON.stringify(raw, null, 2),
+    raw_attributes: JSON.stringify(normalizedRaw, null, 2),
   }
 }
 

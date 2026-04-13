@@ -19,6 +19,8 @@ venv/
 ENV/
 
 # ML / large artifacts (keep training outputs local)
+vestir-prototype/tryon-sidecar/models/
+vestir-prototype/tryon-sidecar/outputs/
 *.pt
 *.pth
 *.onnx

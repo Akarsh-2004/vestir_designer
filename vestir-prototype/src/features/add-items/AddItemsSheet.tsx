@@ -26,7 +26,8 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
       } catch (error) {
         // Detection unavailable — fall back to direct pipeline.
         try {
-          toast.info("No worries—I'll process the photo directly.")
+          const reason = error instanceof Error ? error.message : 'detect pipeline unavailable'
+          toast.info(`Detect/tryoff fallback: ${reason}`)
           await addPendingItemsFromFiles(files)
           await runHybridAiPipeline()
         } catch (pipelineError) {

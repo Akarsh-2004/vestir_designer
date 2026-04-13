@@ -2,7 +2,6 @@ import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { EmptyState } from '../../components/EmptyState'
 import { ItemPhoto } from '../../components/ItemPhoto'
-import { SkeletonCard } from '../../components/SkeletonCard'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 
 interface ItemsGridProps {
@@ -50,16 +49,12 @@ export function ItemsGrid({ onAddItems }: ItemsGridProps) {
     <div className="grid">
       {items.map((item) => (
         <Link key={item.id} to={`/item/${item.id}`} className="item-card">
-          {!item.ai_processed ? (
-            <SkeletonCard />
-          ) : (
-            <ItemPhoto itemId={item.id} imageUrl={item.image_url} alt={item.item_type} size="full" />
-          )}
+          <ItemPhoto itemId={item.id} imageUrl={item.image_url} alt={item.item_type} size="full" />
           <div className="item-meta">
-            <strong>{item.item_type}</strong>
-            <small>{item.color_primary}</small>
+            <strong>{item.ai_processed ? item.item_type : 'Analyzing...'}</strong>
+            <small>{item.ai_processed ? item.color_primary : 'Please wait'}</small>
             {!item.ai_processed ? (
-              <small>Making sense of your photo… {item.processing_progress ?? 0}%</small>
+              <small>Analyzing…</small>
             ) : null}
           </div>
         </Link>

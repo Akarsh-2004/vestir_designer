@@ -6,11 +6,20 @@ import type {
   DetectedGarment,
   DetectionResult,
   Item,
+  NormalizedBBox,
   Outfit,
   SubjectFilterMode,
   Wardrobe,
 } from '../types/index'
-import { defaultPipelineAdapters, detectItemsFromImage } from '../lib/pipeline/adapters'
+import {
+  applyManualBlur,
+  defaultPipelineAdapters,
+  detectItemsFromImage,
+  embeddingAdapter,
+  reasoningAdapter,
+  runTryoffExtraction,
+  type TryoffGarmentTarget,
+} from '../lib/pipeline/adapters'
 import { processItemPipeline } from '../lib/pipeline/orchestrator'
 
 interface WardrobeStore {
@@ -42,10 +51,21 @@ interface WardrobeStore {
   toggleSubjectFilterPersonSelection: (id: string) => void
   setSubjectFilterMaskPolygon: (polygon: Array<{ x: number; y: number }>) => void
   applySubjectFilter: () => Promise<DetectionResult | null>
+  applyManualBlurToPending: (boxes: NormalizedBBox[]) => Promise<DetectionResult | null>
+  /** FLUX try-off on current pending image (e.g. after blur), then re-run detection on the product shot. */
+  applyTryoffExtractionToPending: (
+    garmentTarget: TryoffGarmentTarget,
+  ) => Promise<
+    | { detection: DetectionResult }
+    | { error: string; tryoffImageUrl?: string | null }
+    | null
+  >
   confirmDetectedItems: () => Promise<void>
   dismissDetection: () => void
   addPendingItemsFromFiles: (files: FileList | null) => Promise<void>
   runHybridAiPipeline: () => Promise<void>
+  /** After fixing type/category on an item that blocked embedding, run embed + reasoning. */
+  completeAttributeReview: (itemId: string) => Promise<void>
 }
 
 function fileToDataUrl(file: File): Promise<string> {
@@ -54,6 +74,21 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onload = () => resolve(String(reader.result))
     reader.readAsDataURL(file)
   })
+}
+
+function inferTryoffTargetFromFilename(filename: string): 'outfit' | 'shirt' | 'dress' | 'pants' | 'jacket' {
+  const f = filename.toLowerCase()
+  if (/(tshirt|t-shirt|shirt|tee|top)/.test(f)) return 'shirt'
+  if (/(dress|frock|gown)/.test(f)) return 'dress'
+  if (/(jeans|pants|trouser|shorts|capri|pyjama)/.test(f)) return 'pants'
+  if (/(jacket|coat|blazer|outerwear|hoodie)/.test(f)) return 'jacket'
+  return 'outfit'
+}
+
+function buildDefaultDetectionSelection(detected: DetectedGarment[]): Set<string> {
+  // Default to all detected garments so multi-item photos (top + jeans, etc.)
+  // create multiple cards unless the user explicitly unselects some.
+  return new Set(detected.map((g) => g.id))
 }
 
 export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
@@ -116,14 +151,25 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
 
   detectItemsFromFile: async (file) => {
     const imageUrl = await fileToDataUrl(file)
-    const result = await detectItemsFromImage(imageUrl, {
+    // Keep uploads responsive by default; enable try-off only when explicitly requested.
+    const tryoffFirst = import.meta.env.VITE_TRYOFF_FIRST === '1'
+    let detectSourceUrl = imageUrl
+    if (tryoffFirst) {
+      const target = inferTryoffTargetFromFilename(file.name)
+      const tryoff = await runTryoffExtraction(imageUrl, target)
+      if (tryoff.implemented && tryoff.tryoffImageUrl) {
+        const rel = tryoff.tryoffImageUrl
+        detectSourceUrl = rel.startsWith('http') ? rel : `${import.meta.env.VITE_API_BASE_URL ?? ''}${rel}`
+      }
+    }
+    const result = await detectItemsFromImage(detectSourceUrl, {
       mode: 'keep_selected_person',
       aiAssist: true,
     })
-    const heroSelections = new Set(result.detected.filter((g) => g.is_hero).map((g) => g.id))
+    const heroSelections = buildDefaultDetectionSelection(result.detected)
     const defaultPeople = new Set((result.person_candidates ?? []).map((p) => p.id))
     set({
-      pendingDetectionImageUrl: imageUrl,
+      pendingDetectionImageUrl: detectSourceUrl,
       pendingDetection: result,
       pendingDetectionSelections: heroSelections,
       subjectFilterMode: result.applied_subject_filter?.mode ?? 'keep_selected_person',
@@ -166,12 +212,97 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
       maskPolygon: subjectFilterMaskPolygon.length >= 3 ? subjectFilterMaskPolygon : undefined,
       aiAssist: true,
     })
-    const heroSelections = new Set(result.detected.filter((g) => g.is_hero).map((g) => g.id))
+    const heroSelections = buildDefaultDetectionSelection(result.detected)
     set({
       pendingDetection: result,
       pendingDetectionSelections: heroSelections,
     })
     return result
+  },
+
+  applyManualBlurToPending: async (boxes) => {
+    const { pendingDetectionImageUrl, pendingDetection, pendingDetectionSelections } = get()
+    if (!pendingDetectionImageUrl || !pendingDetection || !boxes.length) return null
+    const blur = await applyManualBlur(pendingDetectionImageUrl, boxes)
+    if (!blur.blurredImageUrl) return null
+    const blurredUrl = blur.blurredImageUrl.startsWith('http')
+      ? blur.blurredImageUrl
+      : `${import.meta.env.VITE_API_BASE_URL ?? ''}${blur.blurredImageUrl}`
+    // Privacy blur should not change garment candidates/labels.
+    // Keep the current detection result and only update source image references.
+    const result: DetectionResult = {
+      ...pendingDetection,
+      source_image_url: blurredUrl,
+      auto_blurred_image_url: blurredUrl,
+      manual_blur_required: false,
+      warnings: [
+        ...(pendingDetection.warnings ?? []),
+        `Manual blur applied to ${blur.regionsCount} region${blur.regionsCount === 1 ? '' : 's'}.`,
+      ],
+    }
+    set({
+      pendingDetectionImageUrl: blurredUrl,
+      pendingDetection: result,
+      pendingDetectionSelections: new Set(pendingDetectionSelections),
+    })
+    return result
+  },
+
+  applyTryoffExtractionToPending: async (garmentTarget) => {
+    const { pendingDetectionImageUrl, pendingDetection } = get()
+    if (!pendingDetectionImageUrl || !pendingDetection) return null
+    const src = pendingDetectionImageUrl.startsWith('http')
+      ? pendingDetectionImageUrl
+      : `${import.meta.env.VITE_API_BASE_URL ?? ''}${pendingDetectionImageUrl}`
+    const tryoff = await runTryoffExtraction(src, garmentTarget)
+    if (!tryoff.implemented || !tryoff.tryoffImageUrl) {
+      return { error: String(tryoff.message ?? 'Try-off not available or model failed') }
+    }
+    const tryoffUrl = tryoff.tryoffImageUrl.startsWith('http')
+      ? tryoff.tryoffImageUrl
+      : `${import.meta.env.VITE_API_BASE_URL ?? ''}${tryoff.tryoffImageUrl}`
+    let detected: DetectionResult
+    try {
+      detected = await detectItemsFromImage(tryoffUrl, {
+        mode: 'keep_selected_person',
+        aiAssist: true,
+      })
+    } catch (e1) {
+      try {
+        detected = await detectItemsFromImage(tryoffUrl, {
+          mode: 'keep_selected_person',
+          aiAssist: false,
+        })
+      } catch (e2) {
+        const msg = e2 instanceof Error ? e2.message : String(e2)
+        return {
+          error: `Try-off finished but re-detection failed: ${msg}`,
+          tryoffImageUrl: tryoff.tryoffImageUrl,
+        }
+      }
+    }
+    const merged: DetectionResult = {
+      ...detected,
+      source_image_url: tryoffUrl,
+      auto_blurred_image_url: null,
+      source_image_stage: 'tryoff',
+      manual_blur_required: false,
+      warnings: [
+        ...(detected.warnings ?? []),
+        'Virtual try-off (FLUX): garment extracted on white; detections refreshed from product-style image.',
+      ],
+    }
+    const heroSelections = buildDefaultDetectionSelection(merged.detected)
+    const defaultPeople = new Set((merged.person_candidates ?? []).map((p) => p.id))
+    set({
+      pendingDetectionImageUrl: tryoffUrl,
+      pendingDetection: merged,
+      pendingDetectionSelections: heroSelections,
+      subjectFilterMode: merged.applied_subject_filter?.mode ?? 'keep_selected_person',
+      subjectFilterPersonSelections: defaultPeople,
+      subjectFilterMaskPolygon: merged.applied_subject_filter?.maskPolygon ?? [],
+    })
+    return { detection: merged }
   },
 
   confirmDetectedItems: async () => {
@@ -185,7 +316,8 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
       wardrobe_id: activeWardrobeId,
       user_id: 'user-1',
       image_url: garment.crop_url,
-      item_type: garment.label,
+      // Do not show detector guess as final type before AI pipeline completes.
+      item_type: 'Analyzing...',
       category: 'Tops',
       color_primary: 'Unknown',
       color_primary_hsl: { h: 0, s: 0, l: 0 },
@@ -196,6 +328,10 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
       processing_stage: 'uploaded',
       processing_status: 'queued',
       processing_progress: 0,
+      raw_attributes: JSON.stringify({
+        detected_label: garment.label,
+        detected_confidence: garment.confidence,
+      }),
       created_at: now,
       updated_at: now,
     }))
@@ -277,5 +413,44 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
         }),
       ),
     )
+  },
+
+  completeAttributeReview: async (itemId: string) => {
+    const item = get().items.find((i) => i.id === itemId && !i.deleted_at)
+    if (!item?.attribute_review_pending) return
+    get().updateItem(itemId, {
+      processing_status: 'running',
+      processing_progress: 92,
+      processing_stage: 'embedding',
+    })
+    try {
+      const embedResult = await embeddingAdapter(item)
+      const reasoning = await reasoningAdapter(item)
+      let baseRaw: Record<string, unknown> = {}
+      try {
+        baseRaw = JSON.parse(item.raw_attributes ?? '{}') as Record<string, unknown>
+      } catch {
+        baseRaw = {}
+      }
+      get().updateItem(itemId, {
+        ai_processed: true,
+        attribute_review_pending: false,
+        processing_stage: 'complete',
+        processing_status: 'done',
+        processing_progress: 100,
+        reasoning_summary: reasoning.summary,
+        raw_attributes: JSON.stringify(
+          { ...baseRaw, embedding_metadata: embedResult.metadata },
+          null,
+          2,
+        ),
+      })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Embedding failed'
+      get().updateItem(itemId, {
+        processing_status: 'failed',
+        processing_error: msg,
+      })
+    }
   },
 }))

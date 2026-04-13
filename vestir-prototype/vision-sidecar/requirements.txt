@@ -3,3 +3,8 @@ uvicorn
 numpy
 opencv-python
 python-multipart
+torch
+transformers
+pillow
+open-clip-torch
+huggingface_hub
