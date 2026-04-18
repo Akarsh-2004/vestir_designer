@@ -88,7 +88,9 @@ export interface NormalizedBBox {
   y2: number
 }
 
-export type SubjectFilterMode = 'keep_selected_person' | 'clothing_only'
+export type SubjectFilterMode = 'keep_selected_person' | 'clothing_only' | 'focus_person_blur_others'
+
+export type BlurQualityPreset = 'soft' | 'pro' | 'strong'
 
 export interface SubjectFilterConfig {
   mode: SubjectFilterMode

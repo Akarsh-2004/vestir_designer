@@ -1,16 +1,30 @@
 import { CheckCircle, Circle, Star } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import type { MouseEvent as ReactMouseEvent } from 'react'
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { toast } from 'sonner'
-import type { TryoffGarmentTarget } from '../../lib/pipeline/adapters'
+import { refineMaskWithSam } from '../../lib/pipeline/adapters'
 import { useWardrobeStore } from '../../store/wardrobeStore'
-import type { DetectedGarment, SubjectFilterMode } from '../../types/index'
+import type { BlurQualityPreset, DetectedGarment, NormalizedBBox, SubjectFilterMode } from '../../types/index'
+
+type SelectionTool = 'polygon' | 'rectangle'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
+/** In dev, load /storage/* through the Vite dev server proxy (same origin as the UI). */
+function storagePathForDevProxy(url: string): string | null {
+  if (!import.meta.env.DEV) return null
+  const m = url.match(/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(\/storage\/[^?#]*)((?:\?|#).*)?$/i)
+  if (!m) return null
+  return `${m[1]}${m[2] ?? ''}`
+}
+
 function absoluteUrl(url: string) {
-  if (url.startsWith('http')) return url
-  return `${API_BASE}${url}`
+  if (!url) return url
+  if (url.startsWith('data:')) return url
+  const resolved = url.startsWith('http') ? url : `${API_BASE}${url}`
+  const proxied = storagePathForDevProxy(resolved)
+  if (proxied) return proxied
+  return resolved
 }
 
 interface DetectionCardProps {
@@ -28,6 +42,31 @@ function polygonArea(points: Array<{ x: number; y: number }>) {
     sum += a.x * b.y - b.x * a.y
   }
   return Math.abs(sum) / 2
+}
+
+function pointInPolygon(point: { x: number; y: number }, polygon: Array<{ x: number; y: number }>) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x
+    const yi = polygon[i].y
+    const xj = polygon[j].x
+    const yj = polygon[j].y
+    const intersect = ((yi > point.y) !== (yj > point.y))
+      && (point.x < ((xj - xi) * (point.y - yi)) / ((yj - yi) || Number.EPSILON) + xi)
+    if (intersect) inside = !inside
+  }
+  return inside
+}
+
+function normalizedBboxFromPolygon(poly: Array<{ x: number; y: number }>): NormalizedBBox {
+  const xs = poly.map((p) => p.x)
+  const ys = poly.map((p) => p.y)
+  return {
+    x1: Math.max(0, Math.min(...xs)),
+    y1: Math.max(0, Math.min(...ys)),
+    x2: Math.min(1, Math.max(...xs)),
+    y2: Math.min(1, Math.max(...ys)),
+  }
 }
 
 function DetectionCard({ garment, selected, onToggle }: DetectionCardProps) {
@@ -66,25 +105,67 @@ function DetectionCard({ garment, selected, onToggle }: DetectionCardProps) {
 export function DetectionReviewSheet() {
   const {
     pendingDetection,
+    pendingDetectionImageUrl,
     subjectFilterMode,
+    blurQualityPreset,
     subjectFilterPersonSelections,
     subjectFilterMaskPolygon,
     pendingDetectionSelections,
     setSubjectFilterMode,
+    setBlurQualityPreset,
     toggleSubjectFilterPersonSelection,
     setSubjectFilterMaskPolygon,
     applySubjectFilter,
     applyManualBlurToPending,
-    applyTryoffExtractionToPending,
+    generateMannequinToPending,
     toggleDetectionSelection,
+    undoEditorState,
+    redoEditorState,
+    editorHistoryPast,
+    editorHistoryFuture,
     confirmDetectedItems,
     dismissDetection,
   } = useWardrobeStore()
   const editorRef = useRef<HTMLDivElement | null>(null)
+  const previewLoadWarned = useRef(false)
   const [dragPointIndex, setDragPointIndex] = useState<number | null>(null)
   const [polygonClosed, setPolygonClosed] = useState(false)
-  const [tryoffGarmentTarget, setTryoffGarmentTarget] = useState<TryoffGarmentTarget>('outfit')
-  const [extractClothingBusy, setExtractClothingBusy] = useState(false)
+  const [hoverPersonId, setHoverPersonId] = useState<string | null>(null)
+  const [focusRectStart, setFocusRectStart] = useState<{ x: number; y: number } | null>(null)
+  const [focusRectDraft, setFocusRectDraft] = useState<{
+    x1: number
+    y1: number
+    x2: number
+    y2: number
+  } | null>(null)
+  const [selectionTool, setSelectionTool] = useState<SelectionTool>('polygon')
+  const [lastSamHintBbox, setLastSamHintBbox] = useState<NormalizedBBox | null>(null)
+  /**
+   * Tracks long-running async work so the UI can show a blocking overlay
+   * (spinner + elapsed timer) instead of the user clicking the scrim in
+   * confusion and ending up back on the main page while the request is
+   * still in flight.
+   */
+  const [busyTask, setBusyTask] = useState<{
+    label: string
+    sub?: string
+    startedAt: number
+  } | null>(null)
+  const [busyElapsedMs, setBusyElapsedMs] = useState(0)
+  /** Prevents overlapping mannequin runs — a second click used to leave Sonner + overlay out of sync. */
+  const mannequinInFlightRef = useRef(false)
+
+  useEffect(() => {
+    if (!busyTask) {
+      setBusyElapsedMs(0)
+      return undefined
+    }
+    setBusyElapsedMs(Date.now() - busyTask.startedAt)
+    const timer = window.setInterval(() => {
+      setBusyElapsedMs(Date.now() - busyTask.startedAt)
+    }, 250)
+    return () => window.clearInterval(timer)
+  }, [busyTask])
 
   if (!pendingDetection) return null
 
@@ -97,6 +178,7 @@ export function DetectionReviewSheet() {
     auto_blurred_image_url,
     source_image_stage,
   } = pendingDetection
+  const latestWarning = pendingDetection.warnings?.[pendingDetection.warnings.length - 1]
   const selectedCount = pendingDetectionSelections.size
   const allSelected = detected.every((g) => pendingDetectionSelections.has(g.id))
   const allPeopleSelected = person_candidates.length > 0
@@ -106,11 +188,24 @@ export function DetectionReviewSheet() {
   const polygonPointsSvg = subjectFilterMaskPolygon
     .map((p) => `${(p.x * 100).toFixed(2)},${(p.y * 100).toFixed(2)}`)
     .join(' ')
+  const busyElapsedSeconds = busyTask ? Math.max(0, Math.floor(busyElapsedMs / 1000)) : 0
+  const isBusy = Boolean(busyTask)
 
-  const activeImageUrl = auto_blurred_image_url || source_image_url
+  // Use store-tracked current preview URL first (latest processed image),
+  // then fallback to payload fields.
+  const activeImageUrl = pendingDetectionImageUrl || source_image_url || auto_blurred_image_url || ''
+  const previewSrc = absoluteUrl(activeImageUrl)
+
+  useEffect(() => {
+    previewLoadWarned.current = false
+  }, [previewSrc])
 
   function changeFilterMode(mode: SubjectFilterMode) {
     setSubjectFilterMode(mode)
+  }
+
+  function changeBlurPreset(preset: BlurQualityPreset) {
+    setBlurQualityPreset(preset)
   }
 
   function toggleAllPeople() {
@@ -125,7 +220,187 @@ export function DetectionReviewSheet() {
     }
   }
 
+  async function autoSelectPersonWithSam(personId: string, clickPoint?: { x: number; y: number }) {
+    const candidate = person_candidates.find((p) => p.id === personId)
+    if (!candidate) return
+    try {
+      const boxes = [candidate.bbox]
+      if (clickPoint) {
+        const half = 0.13
+        boxes.unshift({
+          x1: Math.max(candidate.bbox.x1, clickPoint.x - half),
+          y1: Math.max(candidate.bbox.y1, clickPoint.y - half),
+          x2: Math.min(candidate.bbox.x2, clickPoint.x + half),
+          y2: Math.min(candidate.bbox.y2, clickPoint.y + half),
+        })
+      }
+      const polygons = await refineMaskWithSam(activeImageUrl, boxes)
+      const valid = (polygons ?? []).filter((poly) => poly.length >= 3)
+      if (!valid.length) return
+      const picked = clickPoint
+        ? valid
+          .filter((poly) => pointInPolygon(clickPoint, poly))
+          .sort((a, b) => polygonArea(a) - polygonArea(b))[0] ?? valid[0]
+        : valid[0]
+      if (picked && picked.length >= 3) {
+        setSubjectFilterMaskPolygon(picked)
+        setPolygonClosed(true)
+      }
+    } catch {
+      // Keep interaction non-blocking; bbox-based person focus still works even if SAM fails.
+    }
+  }
+
+  function handlePersonChipClick(personId: string) {
+    const willSelect = !subjectFilterPersonSelections.has(personId)
+    toggleSubjectFilterPersonSelection(personId)
+    if (willSelect) {
+      void autoSelectPersonWithSam(personId)
+      return
+    }
+    const stillSelectedCount = subjectFilterPersonSelections.size - 1
+    if (stillSelectedCount <= 0) {
+      setSubjectFilterMaskPolygon([])
+      setPolygonClosed(false)
+    }
+  }
+
+  function pointFromPointerEvent(clientX: number, clientY: number) {
+    const container = editorRef.current
+    if (!container) return null
+    const rect = container.getBoundingClientRect()
+    return {
+      x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)),
+    }
+  }
+
+  function overlapRatio(
+    a: { x1: number; y1: number; x2: number; y2: number },
+    b: { x1: number; y1: number; x2: number; y2: number },
+  ) {
+    const x1 = Math.max(a.x1, b.x1)
+    const y1 = Math.max(a.y1, b.y1)
+    const x2 = Math.min(a.x2, b.x2)
+    const y2 = Math.min(a.y2, b.y2)
+    if (x2 <= x1 || y2 <= y1) return 0
+    const inter = (x2 - x1) * (y2 - y1)
+    const base = Math.max(1e-6, (a.x2 - a.x1) * (a.y2 - a.y1))
+    return inter / base
+  }
+
+  async function runSamFromFocusRect(rect: { x1: number; y1: number; x2: number; y2: number }) {
+    setBusyTask({
+      label: 'SAM is isolating your selection…',
+      sub: 'First run can take 5–20 s while the model warms up.',
+      startedAt: Date.now(),
+    })
+    let polygons: Array<Array<{ x: number; y: number }>> | null = null
+    try {
+      polygons = await refineMaskWithSam(activeImageUrl, [rect])
+    } catch (error) {
+      setBusyTask(null)
+      toast.error(error instanceof Error ? error.message : 'SAM refinement failed')
+      return
+    }
+    const best = (polygons ?? [])
+      .filter((poly) => poly.length >= 3)
+      .sort((a, b) => polygonArea(a) - polygonArea(b))[0]
+    if (!best) {
+      setBusyTask(null)
+      toast.error('SAM could not isolate that person. Try a tighter rectangle.')
+      return
+    }
+    setSubjectFilterMaskPolygon(best)
+    setPolygonClosed(true)
+    if (person_candidates.length > 0) {
+      const pick = person_candidates
+        .slice()
+        .sort((a, b) => overlapRatio(rect, b.bbox) - overlapRatio(rect, a.bbox))[0]
+      if (pick) {
+        person_candidates.forEach((candidate) => {
+          const selected = subjectFilterPersonSelections.has(candidate.id)
+          if (candidate.id === pick.id && !selected) toggleSubjectFilterPersonSelection(candidate.id)
+          if (candidate.id !== pick.id && selected) toggleSubjectFilterPersonSelection(candidate.id)
+        })
+      }
+    }
+    setLastSamHintBbox({
+      x1: Math.min(rect.x1, rect.x2),
+      y1: Math.min(rect.y1, rect.y2),
+      x2: Math.max(rect.x1, rect.x2),
+      y2: Math.max(rect.y1, rect.y2),
+    })
+    setBusyTask(null)
+    toast.success(
+      person_candidates.length > 0
+        ? 'Person selected from rectangle with SAM'
+        : 'Region captured with SAM. Use Refine mask or Generate mannequin next.',
+    )
+  }
+
+  function handleEditorPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+    if (selectionTool !== 'rectangle') return
+    if (e.button !== 0) return
+    e.preventDefault()
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    const point = pointFromPointerEvent(e.clientX, e.clientY)
+    if (!point) return
+    setFocusRectStart(point)
+    setFocusRectDraft({ x1: point.x, y1: point.y, x2: point.x, y2: point.y })
+  }
+
+  function handleEditorPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+    if (selectionTool !== 'rectangle' || focusRectStart === null) return
+    const point = pointFromPointerEvent(e.clientX, e.clientY)
+    if (!point) return
+    setFocusRectDraft({
+      x1: Math.min(focusRectStart.x, point.x),
+      y1: Math.min(focusRectStart.y, point.y),
+      x2: Math.max(focusRectStart.x, point.x),
+      y2: Math.max(focusRectStart.y, point.y),
+    })
+  }
+
+  function handleEditorPointerUp(e: ReactPointerEvent<HTMLDivElement>) {
+    if (selectionTool !== 'rectangle') return
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+    } catch {
+      /* ignore */
+    }
+    const rect = focusRectDraft
+    setFocusRectStart(null)
+    setFocusRectDraft(null)
+    if (!rect) return
+    if ((rect.x2 - rect.x1) * (rect.y2 - rect.y1) < 0.004) {
+      toast.message('Draw a slightly larger rectangle around one person or garment.')
+      return
+    }
+    void runSamFromFocusRect(rect)
+  }
+
+  function handleEditorPointerCancel(e: ReactPointerEvent<HTMLDivElement>) {
+    if (selectionTool !== 'rectangle') return
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+    } catch {
+      /* ignore */
+    }
+    setFocusRectStart(null)
+    setFocusRectDraft(null)
+  }
+
   function addPolygonPoint(e: ReactMouseEvent<HTMLDivElement>) {
+    if (selectionTool === 'rectangle') return
     if (dragPointIndex !== null || polygonClosed) return
     const container = editorRef.current
     if (!container) return
@@ -135,7 +410,7 @@ export function DetectionReviewSheet() {
     if (subjectFilterMaskPolygon.length >= 3) {
       const first = subjectFilterMaskPolygon[0]
       const distance = Math.hypot(first.x - x, first.y - y)
-      if (distance < 0.035) {
+      if (distance < 0.02) {
         setPolygonClosed(true)
         return
       }
@@ -160,14 +435,21 @@ export function DetectionReviewSheet() {
     const onMove = (event: globalThis.MouseEvent) => {
       updatePoint(event.clientX, event.clientY)
     }
+    const onPointerMove = (event: PointerEvent) => {
+      updatePoint(event.clientX, event.clientY)
+    }
     const onUp = () => {
       setDragPointIndex(null)
     }
     window.addEventListener('mousemove', onMove)
+    window.addEventListener('pointermove', onPointerMove)
     window.addEventListener('mouseup', onUp)
+    window.addEventListener('pointerup', onUp)
     return () => {
       window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('pointerup', onUp)
     }
   }, [dragPointIndex, subjectFilterMaskPolygon])
 
@@ -192,6 +474,7 @@ export function DetectionReviewSheet() {
   function clearPolygon() {
     setSubjectFilterMaskPolygon([])
     setPolygonClosed(false)
+    setLastSamHintBbox(null)
   }
 
   function undoPoint() {
@@ -204,8 +487,22 @@ export function DetectionReviewSheet() {
     setPolygonClosed((value) => !value)
   }
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const isUndo = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z' && !event.shiftKey
+      const isRedo = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z' && event.shiftKey
+      if (!isUndo && !isRedo) return
+      event.preventDefault()
+      if (isUndo) undoEditorState()
+      if (isRedo) redoEditorState()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [undoEditorState, redoEditorState])
+
   async function handleApplySubjectFilter() {
     const toastId = toast.loading('Applying subject filter...')
+    setBusyTask({ label: 'Applying subject filter…', startedAt: Date.now() })
     try {
       const result = await applySubjectFilter()
       if (!result) {
@@ -219,42 +516,16 @@ export function DetectionReviewSheet() {
       toast.success('Updated detection with subject filtering', { id: toastId })
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Subject filtering failed', { id: toastId })
-    }
-  }
-
-  async function handleExtractClothingTryoff() {
-    const toastId = toast.loading('Extracting clothing (virtual try-off)… this can take a few minutes.')
-    setExtractClothingBusy(true)
-    try {
-      const out = await applyTryoffExtractionToPending(tryoffGarmentTarget)
-      if (out === null) {
-        toast.error('No image to process.', { id: toastId, duration: 12_000 })
-        return
-      }
-      if ('error' in out) {
-        const api = import.meta.env.VITE_API_BASE_URL ?? ''
-        const path = out.tryoffImageUrl ?? ''
-        const viewUrl = path.startsWith('http') ? path : `${api}${path}`
-        const hint = path
-          ? ` Try-off image was saved — open: ${viewUrl}`
-          : ''
-        toast.error(`${out.error}.${hint}`, { id: toastId, duration: 25_000 })
-        return
-      }
-      toast.success('Garment extracted on white. Detections updated from the product shot.', {
-        id: toastId,
-        duration: 8000,
-      })
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Try-off failed', { id: toastId, duration: 15_000 })
     } finally {
-      setExtractClothingBusy(false)
+      setBusyTask(null)
     }
   }
 
   function handleScrimPointerDown() {
-    if (extractClothingBusy) {
-      toast.message('Try-off is still running — wait for it to finish, or use Not now after it completes.')
+    if (busyTask) {
+      toast.message(
+        `${busyTask.label} Please wait — tap outside again once it finishes.`,
+      )
       return
     }
     dismissDetection()
@@ -274,15 +545,166 @@ export function DetectionReviewSheet() {
       y2: Math.min(1, Math.max(...ys)),
     }
     const toastId = toast.loading('Applying manual blur...')
+    setBusyTask({ label: 'Applying manual blur…', startedAt: Date.now() })
     try {
       const result = await applyManualBlurToPending([box])
       if (!result) {
         toast.error('Manual blur failed.', { id: toastId })
         return
       }
-      toast.success('Manual blur applied and detections refreshed.', { id: toastId })
+      toast.success('Manual blur applied with selected quality.', { id: toastId })
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Manual blur failed', { id: toastId })
+    } finally {
+      setBusyTask(null)
+    }
+  }
+
+  /**
+   * Ensures a *tight* SAM polygon exists before we ask the server to cut a mannequin.
+   *
+   * Without this, clicking "Generate mannequin" with only an auto-selected person chip
+   * would send the whole-person bbox (often 80–95% of the frame). The server would then
+   * composite that near-full rectangle onto white and return a JPEG that looks identical
+   * to the source, making the user think "nothing happened" even though the API returned 200.
+   *
+   * We try SAM on (in order): the current rectangle hint, selected people, then the first
+   * garment bbox if the server exposed `detected_regions` (new in this build).
+   */
+  async function ensureTightMaskBeforeMannequin(): Promise<boolean> {
+    if (polygonClosed && subjectFilterMaskPolygon.length >= 3) return true
+
+    const selectedPeople = person_candidates.filter((p) => subjectFilterPersonSelections.has(p.id))
+    const hintBoxes: NormalizedBBox[] = lastSamHintBbox
+      ? [lastSamHintBbox]
+      : selectedPeople.length > 0
+        ? selectedPeople.map((p) => p.bbox)
+        : []
+
+    if (hintBoxes.length === 0) {
+      toast.error(
+        'Draw a rectangle around the person or garment first, then press Generate mannequin.',
+      )
+      return false
+    }
+
+    try {
+      const polygons = await refineMaskWithSam(activeImageUrl, hintBoxes)
+      const valid = (polygons ?? []).filter((poly) => poly.length >= 3)
+      if (!valid.length) {
+        toast.error(
+          'SAM could not isolate the garment. Draw a tighter rectangle around the clothing and try again.',
+        )
+        return false
+      }
+      const picked = [...valid].sort((a, b) => polygonArea(a) - polygonArea(b))[0]
+      const bboxArea = (() => {
+        const b = normalizedBboxFromPolygon(picked)
+        return Math.max(0, (b.x2 - b.x1) * (b.y2 - b.y1))
+      })()
+      if (bboxArea > 0.97) {
+        toast.error(
+          'SAM returned a near-full-frame mask. Draw a tighter rectangle around just the garment and retry.',
+        )
+        return false
+      }
+      setSubjectFilterMaskPolygon(picked)
+      setPolygonClosed(true)
+      return true
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'SAM refinement failed')
+      return false
+    }
+  }
+
+  async function handleGenerateMannequin() {
+    if (mannequinInFlightRef.current) {
+      toast.message('Mannequin generation is already running — wait for it to finish.')
+      return
+    }
+    mannequinInFlightRef.current = true
+    const toastId = toast.loading('Preparing mannequin cutout...')
+    setBusyTask({
+      label: 'Isolating garment with SAM…',
+      sub: 'This usually takes 10–30 s on first run (SAM warms up). Please keep this sheet open.',
+      startedAt: Date.now(),
+    })
+    try {
+      const masked = await ensureTightMaskBeforeMannequin()
+      if (!masked) {
+        toast.dismiss(toastId)
+        return
+      }
+      setBusyTask({
+        label: 'Building mannequin on white background…',
+        sub: 'Compositing cutout, then re-running clothing detection. 3–20 s typical.',
+        startedAt: Date.now(),
+      })
+      toast.loading('Generating mannequin on white background...', { id: toastId })
+      const result = await generateMannequinToPending()
+      if (!result) {
+        toast.error('No pending image to generate from.', { id: toastId })
+        return
+      }
+      // Clear overlay + dismiss loading toast *before* success so Sonner never shows
+      // a loading spinner and a success message on the same toast id in one frame.
+      setBusyTask(null)
+      toast.dismiss(toastId)
+      toast.success('Mannequin generated. Background is white and detections refreshed.')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Mannequin generation failed', { id: toastId })
+    } finally {
+      setBusyTask(null)
+      mannequinInFlightRef.current = false
+    }
+  }
+
+  async function handleSamRefineMask() {
+    const selectedPeople = person_candidates.filter((p) => subjectFilterPersonSelections.has(p.id))
+    let boxes: NormalizedBBox[] = []
+    if (selectedPeople.length > 0) {
+      boxes = selectedPeople.map((p) => p.bbox)
+    } else if (polygonClosed && subjectFilterMaskPolygon.length >= 3) {
+      boxes = [normalizedBboxFromPolygon(subjectFilterMaskPolygon)]
+    } else if (lastSamHintBbox) {
+      boxes = [lastSamHintBbox]
+    } else {
+      toast.warning(
+        'Draw a rectangle (Rectangle tool), close a polygon, or select people — then SAM can refine the mask.',
+      )
+      return
+    }
+    const toastId = toast.loading('Refining mask with SAM...')
+    setBusyTask({
+      label: 'Refining mask with SAM…',
+      sub: 'Segment Anything is processing your selection. 2–10 s typical.',
+      startedAt: Date.now(),
+    })
+    try {
+      const polygons = await refineMaskWithSam(activeImageUrl, boxes)
+      const valid = (polygons ?? []).filter((poly) => poly.length >= 3)
+      if (!valid.length) {
+        toast.error('SAM could not generate a clean polygon. Try adjusting selection.', { id: toastId })
+        return
+      }
+      const picked =
+        boxes.length === 1
+          ? [...valid].sort((a, b) => polygonArea(a) - polygonArea(b))[0]
+          : valid[0]
+      if (!picked || picked.length < 3) {
+        toast.error('SAM could not generate a clean polygon. Try adjusting selection.', { id: toastId })
+        return
+      }
+      setSubjectFilterMaskPolygon(picked)
+      setPolygonClosed(true)
+      if (boxes.length === 1) {
+        setLastSamHintBbox(boxes[0])
+      }
+      toast.success('Mask refined with SAM. You can still edit points manually.', { id: toastId })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'SAM refinement failed', { id: toastId })
+    } finally {
+      setBusyTask(null)
     }
   }
 
@@ -342,6 +764,26 @@ export function DetectionReviewSheet() {
             >
               Clothing only
             </button>
+            <button
+              type="button"
+              className={`subject-filter__mode ${subjectFilterMode === 'focus_person_blur_others' ? 'is-active' : ''}`}
+              onClick={() => changeFilterMode('focus_person_blur_others')}
+            >
+              Focus person (blur others)
+            </button>
+          </div>
+          <div className="subject-filter__mode-row">
+            <span className="subject-filter__hint" style={{ margin: 0 }}>Blur quality</span>
+            {(['soft', 'pro', 'strong'] as BlurQualityPreset[]).map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                className={`subject-filter__mode ${blurQualityPreset === preset ? 'is-active' : ''}`}
+                onClick={() => changeBlurPreset(preset)}
+              >
+                {preset}
+              </button>
+            ))}
           </div>
           {person_candidates.length > 0 && (
             <>
@@ -357,7 +799,9 @@ export function DetectionReviewSheet() {
                     key={candidate.id}
                     type="button"
                     className={`subject-filter__chip ${subjectFilterPersonSelections.has(candidate.id) ? 'is-active' : ''}`}
-                    onClick={() => toggleSubjectFilterPersonSelection(candidate.id)}
+                    onClick={() => handlePersonChipClick(candidate.id)}
+                    onMouseEnter={() => setHoverPersonId(candidate.id)}
+                    onMouseLeave={() => setHoverPersonId(null)}
                   >
                     {candidate.label}
                   </button>
@@ -367,25 +811,105 @@ export function DetectionReviewSheet() {
           )}
           <div className="subject-filter__polygon">
             <p className="subject-filter__hint" style={{ marginBottom: 6 }}>
-              Manual override: click to add points, drag points to adjust, click first point to close.
+              Faces are blurred automatically when detected (preview uses the processed image).
+              Use Rectangle (SAM) to outline one person or garment, then Generate mannequin; detection refreshes from that cutout.
+            </p>
+            <div className="subject-filter__mode-row" style={{ flexWrap: 'wrap', gap: 6 }}>
+              <span className="subject-filter__hint" style={{ margin: 0 }}>Mask tool</span>
+              <button
+                type="button"
+                className={`subject-filter__mode ${selectionTool === 'polygon' ? 'is-active' : ''}`}
+                onClick={() => setSelectionTool('polygon')}
+              >
+                Polygon
+              </button>
+              <button
+                type="button"
+                className={`subject-filter__mode ${selectionTool === 'rectangle' ? 'is-active' : ''}`}
+                onClick={() => setSelectionTool('rectangle')}
+              >
+                Rectangle (SAM)
+              </button>
+            </div>
+            <p className="subject-filter__hint" style={{ marginBottom: 6 }}>
+              {selectionTool === 'polygon'
+                ? 'Polygon: click to add points, drag points to adjust, click first point to close.'
+                : 'Rectangle: drag on the photo to run SAM on that region (works for any subject filter mode).'}
             </p>
             <div className="subject-filter__metrics">
               <span>{polygonPointLabel}</span>
               <span>{polygonClosed ? 'Closed' : 'Open'} polygon</span>
               <span>{selectedAreaPct}% selected</span>
             </div>
+            {latestWarning && (
+              <p className="subject-filter__hint" style={{ marginBottom: 6 }}>
+                {latestWarning}
+              </p>
+            )}
             <div
               ref={editorRef}
               className="subject-filter__editor"
-              onClick={addPolygonPoint}
+              style={{ cursor: isBusy ? 'wait' : selectionTool === 'rectangle' ? 'crosshair' : undefined }}
+              onClick={isBusy ? undefined : addPolygonPoint}
+              onPointerDown={isBusy ? undefined : handleEditorPointerDown}
+              onPointerMove={isBusy ? undefined : handleEditorPointerMove}
+              onPointerUp={isBusy ? undefined : handleEditorPointerUp}
+              onPointerCancel={isBusy ? undefined : handleEditorPointerCancel}
+              title={
+                isBusy
+                  ? busyTask?.label ?? 'Working…'
+                  : selectionTool === 'rectangle'
+                    ? 'Drag a rectangle over one person or garment; SAM builds the mask'
+                    : 'Click to add polygon points'
+              }
             >
               <img
-                src={absoluteUrl(activeImageUrl)}
-                alt="Source for subject filtering"
+                key={previewSrc}
+                src={previewSrc}
+                alt="Source for subject filtering and mannequin preview"
                 className="subject-filter__image"
                 draggable={false}
+                onError={() => {
+                  if (previewLoadWarned.current) return
+                  previewLoadWarned.current = true
+                  toast.error(
+                    'Preview image failed to load. In dev, leave VITE_API_BASE_URL empty so /storage uses the Vite proxy, or ensure the API is running on the URL in .env.',
+                  )
+                }}
               />
+              {busyTask && (
+                <div
+                  className="subject-filter__busy"
+                  role="status"
+                  aria-live="polite"
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <div className="subject-filter__busy-spinner" aria-hidden="true" />
+                  <div className="subject-filter__busy-label">
+                    {busyTask.label} {busyElapsedSeconds}s
+                  </div>
+                  {busyTask.sub && (
+                    <div className="subject-filter__busy-sub">{busyTask.sub}</div>
+                  )}
+                </div>
+              )}
               <svg className="subject-filter__overlay" viewBox="0 0 100 100" preserveAspectRatio="none">
+                {person_candidates.map((candidate) => {
+                  const selected = subjectFilterPersonSelections.has(candidate.id)
+                  const hovered = hoverPersonId === candidate.id
+                  const bbox = candidate.bbox
+                  return (
+                    <rect
+                      key={candidate.id}
+                      x={bbox.x1 * 100}
+                      y={bbox.y1 * 100}
+                      width={(bbox.x2 - bbox.x1) * 100}
+                      height={(bbox.y2 - bbox.y1) * 100}
+                      className={`subject-filter__person-box ${selected ? 'is-selected' : ''} ${hovered ? 'is-hovered' : ''}`}
+                    />
+                  )
+                })}
                 {subjectFilterMaskPolygon.length >= 2 && (
                   polygonClosed
                     ? (
@@ -401,10 +925,23 @@ export function DetectionReviewSheet() {
                       />
                     )
                 )}
+                {selectionTool === 'rectangle' && focusRectDraft && (
+                  <rect
+                    x={focusRectDraft.x1 * 100}
+                    y={focusRectDraft.y1 * 100}
+                    width={(focusRectDraft.x2 - focusRectDraft.x1) * 100}
+                    height={(focusRectDraft.y2 - focusRectDraft.y1) * 100}
+                    className="subject-filter__person-box is-selected"
+                  />
+                )}
                 {subjectFilterMaskPolygon.map((point, idx) => (
                   <g
                     key={`${point.x}-${point.y}-${idx}`}
                     onMouseDown={(e) => {
+                      e.stopPropagation()
+                      setDragPointIndex(idx)
+                    }}
+                    onPointerDown={(e) => {
                       e.stopPropagation()
                       setDragPointIndex(idx)
                     }}
@@ -427,6 +964,22 @@ export function DetectionReviewSheet() {
               <button
                 type="button"
                 className="detection-sheet__toggle-all"
+                onClick={undoEditorState}
+                disabled={editorHistoryPast.length === 0}
+              >
+                Undo
+              </button>
+              <button
+                type="button"
+                className="detection-sheet__toggle-all"
+                onClick={redoEditorState}
+                disabled={editorHistoryFuture.length === 0}
+              >
+                Redo
+              </button>
+              <button
+                type="button"
+                className="detection-sheet__toggle-all"
                 onClick={toggleClosePolygon}
                 disabled={subjectFilterMaskPolygon.length < 3}
               >
@@ -435,44 +988,44 @@ export function DetectionReviewSheet() {
               <button type="button" className="detection-sheet__toggle-all" onClick={clearPolygon}>
                 Clear polygon
               </button>
-              <button type="button" className="btn secondary" onClick={handleApplySubjectFilter}>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={handleApplySubjectFilter}
+                disabled={isBusy}
+              >
                 Apply filter
               </button>
-              <button type="button" className="btn secondary" onClick={handleApplyManualBlur}>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={handleSamRefineMask}
+                disabled={isBusy}
+              >
+                Refine mask (SAM)
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={handleApplyManualBlur}
+                disabled={isBusy}
+              >
                 Apply manual blur
               </button>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={handleGenerateMannequin}
+                disabled={isBusy}
+              >
+                {isBusy && busyTask?.label.toLowerCase().includes('mannequin')
+                  ? `Generating mannequin… ${busyElapsedSeconds}s`
+                  : isBusy
+                    ? 'Working…'
+                    : 'Generate mannequin (white bg)'}
+              </button>
             </div>
-            <div className="subject-filter__tryoff" style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
-              <p className="subject-filter__hint" style={{ marginBottom: 8 }}>
-                After faces are blurred, extract clothing as a studio product shot (FLUX + fal try-off LoRA). Pick what to emphasize, then run try-off on the image above.
-              </p>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-                <label htmlFor="tryoff-garment-target" className="subject-filter__hint" style={{ margin: 0 }}>
-                  Garment focus
-                </label>
-                <select
-                  id="tryoff-garment-target"
-                  className="subject-filter__select"
-                  value={tryoffGarmentTarget}
-                  onChange={(e) => setTryoffGarmentTarget(e.target.value as TryoffGarmentTarget)}
-                >
-                  <option value="outfit">Full outfit (standard)</option>
-                  <option value="ensemble">Full outfit (stacked ensemble, premium prompt)</option>
-                  <option value="tshirt">T-shirt / top</option>
-                  <option value="dress">Dress</option>
-                  <option value="pants">Pants / jeans</option>
-                  <option value="jacket">Jacket / coat</option>
-                </select>
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={handleExtractClothingTryoff}
-                  disabled={extractClothingBusy}
-                >
-                  {extractClothingBusy ? 'Extracting…' : 'Extract clothing'}
-                </button>
-              </div>
-            </div>
+            {/* Try-off temporarily disabled to evaluate SAM-based mannequin extraction quality. */}
           </div>
         </div>
 
@@ -491,7 +1044,7 @@ export function DetectionReviewSheet() {
           <button
             type="button"
             className="btn"
-            disabled={selectedCount === 0}
+            disabled={selectedCount === 0 || isBusy}
             onClick={handleConfirm}
             style={{ flex: 1 }}
           >
@@ -500,9 +1053,15 @@ export function DetectionReviewSheet() {
           <button
             type="button"
             className="btn secondary"
-            onClick={dismissDetection}
-            disabled={extractClothingBusy}
+            onClick={() => {
+              if (isBusy) {
+                toast.message('Hold on — ' + (busyTask?.label ?? 'a task is still running…'))
+                return
+              }
+              dismissDetection()
+            }}
             style={{ flex: 0, padding: '10px 14px' }}
+            aria-disabled={isBusy}
           >
             Not now
           </button>

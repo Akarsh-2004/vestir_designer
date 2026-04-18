@@ -1,5 +1,5 @@
 import type { EmbeddingResult, InferenceResult, PipelineAdapters, PreprocessResult, ReasoningResult } from './contracts'
-import type { DetectionResult, Item, NormalizedBBox, SubjectFilterConfig } from '../../types/index'
+import type { BlurQualityPreset, DetectionResult, Item, NormalizedBBox, SubjectFilterConfig } from '../../types/index'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
@@ -23,7 +23,7 @@ export async function detectItemsFromImage(imageUrl: string, subjectFilter?: Sub
   })
   const data = await readJsonOrThrow(response, 'Detection request failed')
   if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : 'Detection failed')
-  return data as DetectionResult
+  return data as unknown as DetectionResult
 }
 
 export type TryoffExtractionResult = {
@@ -36,6 +36,62 @@ export type ManualBlurResult = {
   blurredImageUrl: string | null
   faceBlurApplied: boolean
   regionsCount: number
+}
+
+export type MannequinResult = {
+  mannequinImageUrl: string | null
+}
+
+export async function refineMaskWithSam(
+  imageUrl: string,
+  boxes: NormalizedBBox[],
+): Promise<Array<Array<{ x: number; y: number }>> | null> {
+  const response = await fetch(`${API_BASE}/api/items/sam/refine`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, boxes }),
+  })
+  const data = await readJsonOrThrow(response, 'SAM refine request failed')
+  if (!response.ok) {
+    throw new Error(typeof data.error === 'string' ? data.error : 'SAM refine request failed')
+  }
+  return Array.isArray(data.polygons) ? (data.polygons as Array<Array<{ x: number; y: number }>>) : null
+}
+
+export async function generateMannequinImage(
+  imageUrl: string,
+  subjectFilter: SubjectFilterConfig,
+): Promise<MannequinResult> {
+  const response = await fetch(`${API_BASE}/api/items/mannequin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, subjectFilter }),
+  })
+  const data = await readJsonOrThrow(response, 'Mannequin request failed')
+  if (!response.ok) {
+    let detail =
+      typeof data.error === 'string'
+        ? data.error
+        : `Mannequin request failed (HTTP ${response.status})`
+    if (Array.isArray(data.issues) && data.issues.length) {
+      detail += ` — ${JSON.stringify(data.issues)}`
+    }
+    if (data.code === 'MANNEQUIN_NO_REGION' && data.received) {
+      detail += ` — ${JSON.stringify(data.received)}`
+    }
+    throw new Error(detail)
+  }
+  const mannequinImageUrl = typeof data.mannequinImageUrl === 'string' ? data.mannequinImageUrl : null
+  if (!mannequinImageUrl) {
+    throw new Error('Server returned success but no mannequinImageUrl')
+  }
+  return { mannequinImageUrl }
+}
+
+type ManualBlurRequest = {
+  boxes: NormalizedBBox[]
+  maskPolygon?: Array<{ x: number; y: number }>
+  blurPreset?: BlurQualityPreset
 }
 
 /** Virtual try-off: worn photo → garment on white (FLUX + LoRA). Used before /detect when enabled. */
@@ -69,18 +125,18 @@ export async function runTryoffExtraction(
   return {
     implemented: Boolean(data.implemented),
     tryoffImageUrl: typeof data.tryoffImageUrl === 'string' ? data.tryoffImageUrl : null,
-    message: data.message ?? null,
+    message: typeof data.message === 'string' ? data.message : null,
   }
 }
 
 export async function applyManualBlur(
   imageUrl: string,
-  boxes: NormalizedBBox[],
+  request: ManualBlurRequest,
 ): Promise<ManualBlurResult> {
   const response = await fetch(`${API_BASE}/api/items/blur-manual`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ imageUrl, boxes }),
+    body: JSON.stringify({ imageUrl, ...request }),
   })
   const data = await readJsonOrThrow(response, 'Manual blur request failed')
   if (!response.ok) {
@@ -171,6 +227,17 @@ function normalizeItemType(raw: InferenceResult): string {
   return toTitleCase(source.replace(/[_-]+/g, ' '))
 }
 
+function inferCategoryFromItemType(itemType: string): Item['category'] | null {
+  const key = itemType.trim().toLowerCase()
+  if (!key) return null
+  if (/(trouser|trousers|pants|jeans|shorts|skirt|capri|pyjama)/.test(key)) return 'Bottoms'
+  if (/(jacket|coat|blazer|outerwear)/.test(key)) return 'Outerwear'
+  if (/(shoe|shoes|sneaker|boot|loafer|heel|sandal|footwear)/.test(key)) return 'Shoes'
+  if (/(belt|bag|cap|hat|watch|jewelry|accessory|accessories|scarf)/.test(key)) return 'Accessories'
+  if (/(shirt|tshirt|t-shirt|top|dress|frock|hoodie|sweater|sweatshirt|vest)/.test(key)) return 'Tops'
+  return null
+}
+
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
@@ -225,8 +292,9 @@ export const advancedLocalAnalysisAdapter = async (
 export const normalizeAttributesAdapter = async (raw: InferenceResult): Promise<Partial<Item>> => {
   const normalizedSeason = normalizeSeason(raw.season)
   const normalizedFormality = Math.max(1, Math.min(10, raw.formality || 5))
-  const normalizedCategory = normalizeCategory(raw.category)
   const normalizedItemType = normalizeItemType(raw)
+  const inferredCategory = inferCategoryFromItemType(normalizedItemType)
+  const normalizedCategory = inferredCategory ?? normalizeCategory(raw.category)
   const normalizedFit = normalizeFit(raw.fit)
   const normalizedMaterial = normalizeMaterial(raw.material)
   const styleTags = raw.style_archetype ? [toTitleCase(raw.style_archetype)] : []

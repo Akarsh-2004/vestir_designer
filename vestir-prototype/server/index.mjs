@@ -194,20 +194,29 @@ const inferSchema = z.object({
   quality: qualitySchema,
 })
 
-const normalizedPointSchema = z.object({ x: z.number(), y: z.number() })
+const finiteCoord = z.coerce.number().refine((n) => Number.isFinite(n), 'coordinate must be finite')
+const normalizedPointSchema = z.object({ x: finiteCoord, y: finiteCoord })
+const bboxCoord01 = z.coerce.number().min(0).max(1)
 const normalizedBboxSchema = z.object({
-  x1: z.number().min(0).max(1),
-  y1: z.number().min(0).max(1),
-  x2: z.number().min(0).max(1),
-  y2: z.number().min(0).max(1),
+  x1: bboxCoord01,
+  y1: bboxCoord01,
+  x2: bboxCoord01,
+  y2: bboxCoord01,
 })
 const subjectFilterSchema = z.object({
-  mode: z.enum(['keep_selected_person', 'clothing_only']).default('keep_selected_person'),
+  mode: z.enum(['keep_selected_person', 'clothing_only', 'focus_person_blur_others']).default('keep_selected_person'),
   selectedPersonIds: z.array(z.string()).optional(),
-  selectedPersonBboxes: z.array(normalizedBboxSchema).optional(),
-  maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
+  selectedPersonBboxes: z.preprocess(
+    (val) => (Array.isArray(val) && val.length === 0 ? undefined : val),
+    z.array(normalizedBboxSchema).optional(),
+  ),
+  /** 3+ points: polygon mask; 1–2 points: axis-aligned fallback in /mannequin; SAM can return many vertices. */
+  maskPolygon: z.preprocess(
+    (val) => (Array.isArray(val) && val.length === 0 ? undefined : val),
+    z.array(normalizedPointSchema).min(1).max(50000).optional(),
+  ),
   aiAssist: z.boolean().optional(),
-}).optional()
+}).nullish()
 const detectRequestSchema = z.object({
   imageUrl: z.string().min(1),
   subjectFilter: subjectFilterSchema,
@@ -272,8 +281,20 @@ const tryoffRequestSchema = z.object({
 })
 const manualBlurRequestSchema = z.object({
   imageUrl: z.string().min(1),
-  boxes: z.array(normalizedBboxSchema).min(1),
+  boxes: z.array(normalizedBboxSchema).optional(),
+  maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
   blurAmount: z.number().int().min(3).max(99).optional(),
+  blurPreset: z.enum(['soft', 'pro', 'strong']).optional(),
+}).refine((v) => (v.boxes?.length ?? 0) > 0 || (v.maskPolygon?.length ?? 0) >= 3, {
+  message: 'Provide at least one blur box or a polygon mask.',
+})
+const mannequinRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  subjectFilter: subjectFilterSchema,
+})
+const samRefineRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  boxes: z.array(normalizedBboxSchema).min(1),
 })
 
 const googleLensExperimentSchema = z.object({
@@ -295,21 +316,63 @@ async function ensureStorage() {
   }
 }
 
+/** Load embedding cache; repair corrupt/truncated JSON so /embed never hard-fails the whole pipeline. */
+async function readEmbeddingsArray() {
+  try {
+    const raw = (await fs.readFile(embeddingsFile, 'utf8')).trim()
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    const backup = `${embeddingsFile}.corrupt.${Date.now()}.bak`
+    try {
+      await fs.rename(embeddingsFile, backup)
+    } catch {
+      /* ignore — file may be missing or busy */
+    }
+    await fs.writeFile(embeddingsFile, JSON.stringify([]), 'utf8')
+    console.warn(`[embeddings] Invalid embeddings.json (${reason}). Reset to []. Backup attempted: ${backup}`)
+    return []
+  }
+}
+
 function parseDataUrl(dataUrl) {
   const match = dataUrl.match(/^data:(.+?);base64,(.+)$/)
   if (!match) throw new Error('Expected base64 data URL image')
   return { mime: match[1], buffer: Buffer.from(match[2], 'base64') }
 }
 
-async function resolveImageBuffer(imageUrl) {
-  if (imageUrl.startsWith('data:')) {
-    return parseDataUrl(imageUrl).buffer
+/**
+ * Browser may send absolute URLs like http://localhost:5173/storage/... (Vite dev).
+ * Node must load from this API (same process), not via the Vite host.
+ */
+function normalizeImageUrlForServerFetch(imageUrl) {
+  if (typeof imageUrl !== 'string' || imageUrl.startsWith('data:')) return imageUrl
+  if (imageUrl.startsWith('/') && !imageUrl.startsWith('//')) return imageUrl
+  try {
+    const u = new URL(imageUrl)
+    const path = `${u.pathname}${u.search}`
+    if (!path.startsWith('/storage/')) return imageUrl
+    if (/^(localhost|127\.0\.0\.1)$/i.test(u.hostname)) {
+      return path
+    }
+  } catch {
+    return imageUrl
   }
-  const fetchUrl = imageUrl.startsWith('http')
-    ? imageUrl
-    : `http://127.0.0.1:${port}${imageUrl}`
+  return imageUrl
+}
+
+async function resolveImageBuffer(imageUrl) {
+  const normalized = normalizeImageUrlForServerFetch(imageUrl)
+  if (normalized.startsWith('data:')) {
+    return parseDataUrl(normalized).buffer
+  }
+  const fetchUrl = normalized.startsWith('http')
+    ? normalized
+    : `http://127.0.0.1:${port}${normalized}`
   const response = await fetch(fetchUrl)
-  if (!response.ok) throw new Error(`Could not fetch image: ${imageUrl}`)
+  if (!response.ok) throw new Error(`Could not fetch image: ${normalized}`)
   return Buffer.from(await response.arrayBuffer())
 }
 
@@ -398,10 +461,23 @@ async function validateInputImage(buffer) {
     lum.push(0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2])
   }
   const brightness = mean(lum)
+  const lumMin = lum.length ? Math.min(...lum) : 0
+  const lumMax = lum.length ? Math.max(...lum) : 0
+  const luminanceSpread = lumMax - lumMin
   if (brightness < 16) return { ok: false, reason: 'Photo is too dark. Please retake in better lighting.' }
-  if (brightness > 248) return { ok: false, reason: 'Photo is overexposed. Please lower brightness and retake.' }
+  // Mannequin / product shots are mostly white (#fff) with a small garment — mean brightness is
+  // very high but luminance still spans dark fabric ↔ paper white. Old rule (mean > 248) rejected
+  // those frames and broke post-mannequin re-detect, making the pipeline look like it "didn't create" anything.
+  if (brightness > 248 && luminanceSpread < 40) {
+    return { ok: false, reason: 'Photo is overexposed. Please lower brightness and retake.' }
+  }
+  if (brightness > 248 && luminanceSpread >= 40) {
+    warnings.push('Very bright image (typical for garment on white). Continuing.')
+  }
   if (brightness < 32) warnings.push('Photo is dark; color confidence may be lower.')
-  if (brightness > 232) warnings.push('Photo is bright; highlights may affect color precision.')
+  if (brightness > 232 && !(brightness > 248 && luminanceSpread >= 40)) {
+    warnings.push('Photo is bright; highlights may affect color precision.')
+  }
 
   // Laplacian-like focus metric (variance of local edge energy)
   const edge = []
@@ -580,6 +656,31 @@ async function callVisionSidecarInfer(buffer) {
     return data.result
   } catch {
     return null
+  }
+}
+
+async function callVisionSidecarSamSegment(buffer, boxes = []) {
+  if (!Array.isArray(boxes) || boxes.length === 0) return []
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 6000)
+    const response = await fetch(`${visionSidecarUrl}/sam/segment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_base64: buffer.toString('base64'),
+        boxes,
+        balanced: true,
+      }),
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+    if (!response.ok) return []
+    const data = await response.json()
+    if (!data?.ok || !Array.isArray(data?.segments)) return []
+    return data.segments
+  } catch {
+    return []
   }
 }
 
@@ -815,6 +916,12 @@ async function blurFaceRegions(buffer, regions, blurSigma = 30) {
   if (!composites.length) return { output: buffer, faceDetected: true, faceBlurApplied: false }
   const output = await sharp(buffer).composite(composites).jpeg({ quality: 82 }).toBuffer()
   return { output, faceDetected: true, faceBlurApplied: true }
+}
+
+function blurSigmaForPreset(preset = 'pro') {
+  if (preset === 'soft') return 14
+  if (preset === 'strong') return 34
+  return 24
 }
 
 async function cropToRegion(buffer, normalizedVertices) {
@@ -1659,6 +1766,26 @@ function normalizedBbox(vertices) {
   }
 }
 
+/** Expand degenerate bboxes (single click / open polyline) so mannequin masks stay valid. */
+function axisAlignedBBoxWithMinSpan(vertices, minSpan = 0.02) {
+  if (!vertices?.length) return null
+  const box = normalizedBbox(vertices)
+  let { x1, y1, x2, y2 } = box
+  if (x2 - x1 < minSpan) {
+    const cx = (x1 + x2) / 2
+    x1 = Math.max(0, cx - minSpan / 2)
+    x2 = Math.min(1, cx + minSpan / 2)
+  }
+  if (y2 - y1 < minSpan) {
+    const cy = (y1 + y2) / 2
+    y1 = Math.max(0, cy - minSpan / 2)
+    y2 = Math.min(1, cy + minSpan / 2)
+  }
+  if (x2 <= x1) x2 = Math.min(1, x1 + minSpan)
+  if (y2 <= y1) y2 = Math.min(1, y1 + minSpan)
+  return { x1, y1, x2, y2 }
+}
+
 function bboxOverlap(a, b) {
   const ix1 = Math.max(a.x1, b.x1)
   const iy1 = Math.max(a.y1, b.y1)
@@ -1701,7 +1828,10 @@ function selectPersonBboxes(subjectFilter, personCandidates = []) {
 
 function shouldKeepGarmentBySubjectFilter(subjectFilter, garmentBbox, selectedPersonBboxes = []) {
   if (!subjectFilter) return true
-  if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) return true
+  if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) {
+    const maskBbox = normalizedBbox(subjectFilter.maskPolygon)
+    return bboxOverlap(maskBbox, garmentBbox) >= 0.12
+  }
   if (subjectFilter.mode === 'clothing_only') return true
   if (selectedPersonBboxes.length === 0) return true
   return selectedPersonBboxes.some((personBbox) => bboxOverlap(personBbox, garmentBbox) >= 0.05)
@@ -1720,13 +1850,45 @@ function buildMaskSvg(width, height, regions = []) {
   )
 }
 
+function buildPolygonMaskSvg(width, height, polygons = []) {
+  const shapeSvg = polygons
+    .map((poly) => {
+      if (!Array.isArray(poly) || poly.length < 3) return ''
+      const points = poly
+        .map((p) => {
+          const x = Math.round(Math.max(0, Math.min(1, Number(p.x ?? 0))) * width)
+          const y = Math.round(Math.max(0, Math.min(1, Number(p.y ?? 0))) * height)
+          return `${x},${y}`
+        })
+        .join(' ')
+      return `<polygon points="${points}" fill="white" />`
+    })
+    .join('')
+  return Buffer.from(
+    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" />${shapeSvg}</svg>`,
+  )
+}
+
 async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidates, garmentBoxes) {
   if (!subjectFilter) return { buffer, warnings: [], applied: undefined }
-  if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) {
-    // In detect flow, preserve all garments and store polygon as a manual hint.
-    // Hard-masking here can hide other garments and collapse multi-item results.
+  if (
+    subjectFilter.mode !== 'focus_person_blur_others'
+    && Array.isArray(subjectFilter.maskPolygon)
+    && subjectFilter.maskPolygon.length >= 3
+  ) {
+    // Manual polygon should visibly keep selection and blur everything else.
+    const meta = await sharp(buffer).metadata()
+    const width = meta.width ?? 1
+    const height = meta.height ?? 1
+    const keepMask = buildPolygonMaskSvg(width, height, [subjectFilter.maskPolygon])
+    const keptRegion = await sharp(buffer).composite([{ input: keepMask, blend: 'dest-in' }]).png().toBuffer()
+    const blurredBase = await sharp(buffer).blur(20).jpeg({ quality: 90 }).toBuffer()
+    const masked = await sharp(blurredBase)
+      .composite([{ input: keptRegion, blend: 'over' }])
+      .jpeg({ quality: 90 })
+      .toBuffer()
     return {
-      buffer,
+      buffer: masked,
       warnings: [],
       applied: { ...subjectFilter },
     }
@@ -1735,6 +1897,44 @@ async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidate
   const width = meta.width ?? 1
   const height = meta.height ?? 1
   const selectedPersonBboxes = selectPersonBboxes(subjectFilter, personCandidates)
+  if (subjectFilter.mode === 'focus_person_blur_others') {
+    if (!selectedPersonBboxes.length) {
+      return {
+        buffer,
+        warnings: ['Focus mode needs at least one selected person.'],
+        applied: { ...subjectFilter, selectedPersonBboxes },
+      }
+    }
+    const samSegments = await callVisionSidecarSamSegment(buffer, selectedPersonBboxes)
+    const samPolygons = samSegments
+      .map((seg) => (Array.isArray(seg?.polygon) ? seg.polygon : []))
+      .filter((poly) => poly.length >= 3)
+    const blurred = await sharp(buffer).blur(18).jpeg({ quality: 90 }).toBuffer()
+    let focused = null
+    if (samPolygons.length > 0) {
+      const keepMask = buildPolygonMaskSvg(width, height, samPolygons)
+      const keptSubject = await sharp(buffer).composite([{ input: keepMask, blend: 'dest-in' }]).png().toBuffer()
+      focused = await sharp(blurred).composite([{ input: keptSubject, blend: 'over' }]).jpeg({ quality: 90 }).toBuffer()
+    } else {
+      const composites = []
+      for (const bbox of selectedPersonBboxes) {
+        const left = Math.max(0, Math.floor(Math.max(0, Math.min(1, bbox.x1)) * width))
+        const top = Math.max(0, Math.floor(Math.max(0, Math.min(1, bbox.y1)) * height))
+        const right = Math.max(0, Math.ceil(Math.max(0, Math.min(1, bbox.x2)) * width))
+        const bottom = Math.max(0, Math.ceil(Math.max(0, Math.min(1, bbox.y2)) * height))
+        const boxW = Math.max(1, right - left)
+        const boxH = Math.max(1, bottom - top)
+        const patch = await sharp(buffer).extract({ left, top, width: boxW, height: boxH }).toBuffer()
+        composites.push({ input: patch, left, top })
+      }
+      focused = await sharp(blurred).composite(composites).jpeg({ quality: 90 }).toBuffer()
+    }
+    return {
+      buffer: focused,
+      warnings: [],
+      applied: { ...subjectFilter, selectedPersonBboxes },
+    }
+  }
   const garmentRegions = garmentBoxes.map((box) => box.bbox)
   const regions = subjectFilter.mode === 'clothing_only' ? garmentRegions : selectedPersonBboxes
   if (!regions.length) {
@@ -1745,11 +1945,18 @@ async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidate
     }
   }
   const mask = buildMaskSvg(width, height, regions)
-  const masked = await sharp(buffer)
-    .composite([{ input: mask, blend: 'dest-in' }])
-    .flatten({ background: '#ffffff' })
-    .jpeg({ quality: 90 })
-    .toBuffer()
+  let masked = null
+  if (subjectFilter.mode === 'keep_selected_person') {
+    const kept = await sharp(buffer).composite([{ input: mask, blend: 'dest-in' }]).png().toBuffer()
+    const blurred = await sharp(buffer).blur(20).jpeg({ quality: 90 }).toBuffer()
+    masked = await sharp(blurred).composite([{ input: kept, blend: 'over' }]).jpeg({ quality: 90 }).toBuffer()
+  } else {
+    masked = await sharp(buffer)
+      .composite([{ input: mask, blend: 'dest-in' }])
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 90 })
+      .toBuffer()
+  }
   return {
     buffer: masked,
     warnings: [],
@@ -2008,7 +2215,7 @@ app.post('/api/items/detect', async (req, res) => {
       source_image_url: `/storage/processed/${sourceFilename}`,
       source_image_stage: sourceStage,
       auto_blurred_image_url: autoBlurUrl,
-      manual_blur_required: faceCandidates.length > 0,
+      manual_blur_required: faceCandidates.length > 0 && !faceBlurApplied,
       applied_subject_filter: appliedSubjectFilter,
       warnings,
       pipeline: {
@@ -2182,10 +2389,16 @@ app.post('/api/items/blur-manual', async (req, res) => {
     const meta = await sharp(buffer).metadata()
     const width = meta.width ?? 0
     const height = meta.height ?? 0
-    const blur = body.blurAmount && body.blurAmount % 2 === 1 ? body.blurAmount : 35
-    const regions = body.boxes
+    const presetSigma = blurSigmaForPreset(body.blurPreset ?? 'pro')
+    const blur = body.blurAmount && body.blurAmount % 2 === 1 ? body.blurAmount : presetSigma
+    const boxRegions = (body.boxes ?? [])
       .map((b) => normalizedToPixelRegion(b, width, height))
       .filter(Boolean)
+    const polygonRegion =
+      Array.isArray(body.maskPolygon) && body.maskPolygon.length >= 3
+        ? normalizedToPixelRegion(normalizedBbox(body.maskPolygon), width, height)
+        : null
+    const regions = polygonRegion ? [...boxRegions, polygonRegion] : boxRegions
     const { output, faceBlurApplied } = await blurFaceRegions(buffer, regions, blur)
     const filename = `${crypto.randomUUID()}.jpg`
     await fs.writeFile(path.join(processedDir, filename), output)
@@ -2197,10 +2410,96 @@ app.post('/api/items/blur-manual', async (req, res) => {
         provider: 'server-manual-blur',
         latency_ms: Date.now() - started,
         version: '1.0.0',
+        blurPreset: body.blurPreset ?? 'pro',
       },
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Manual blur failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    return res.status(400).json({ error: message })
+  }
+})
+
+app.post('/api/items/mannequin', async (req, res) => {
+  try {
+    const parsed = mannequinRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid mannequin request',
+        code: 'VALIDATION',
+        issues: parsed.error.issues,
+      })
+    }
+    const body = parsed.data
+    const source = await resolveImageBuffer(body.imageUrl)
+    const meta = await sharp(source).metadata()
+    const width = meta.width ?? 1
+    const height = meta.height ?? 1
+    const selectedBboxes = Array.isArray(body.subjectFilter?.selectedPersonBboxes)
+      ? body.subjectFilter.selectedPersonBboxes
+      : []
+    const poly = Array.isArray(body.subjectFilter?.maskPolygon) ? body.subjectFilter.maskPolygon : []
+    let keepMask = null
+    if (poly.length >= 3) {
+      keepMask = buildPolygonMaskSvg(width, height, [poly])
+    } else if (poly.length >= 1 && poly.length < 3) {
+      const thin = axisAlignedBBoxWithMinSpan(poly)
+      if (thin) keepMask = buildMaskSvg(width, height, [thin])
+    } else if (selectedBboxes.length > 0) {
+      keepMask = buildMaskSvg(width, height, selectedBboxes)
+    }
+    if (!keepMask) {
+      return res.status(400).json({
+        error:
+          'Select a region/person before mannequin generation. Send subjectFilter.maskPolygon (1+ points) and/or selectedPersonBboxes.',
+        code: 'MANNEQUIN_NO_REGION',
+        received: {
+          hasSubjectFilter: Boolean(body.subjectFilter),
+          maskPointCount: poly.length,
+          bboxCount: selectedBboxes.length,
+        },
+      })
+    }
+    const isolated = await sharp(source).composite([{ input: keepMask, blend: 'dest-in' }]).png().toBuffer()
+    const mannequin = await sharp({
+      create: {
+        width,
+        height,
+        channels: 3,
+        background: '#ffffff',
+      },
+    })
+      .composite([{ input: isolated, blend: 'over' }])
+      .jpeg({ quality: 92 })
+      .toBuffer()
+    const filename = `${crypto.randomUUID()}.jpg`
+    await fs.writeFile(path.join(processedDir, filename), mannequin)
+    return res.json({ mannequinImageUrl: `/storage/processed/${filename}` })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Mannequin generation failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    return res.status(400).json({ error: message })
+  }
+})
+
+app.post('/api/items/sam/refine', async (req, res) => {
+  try {
+    const body = samRefineRequestSchema.parse(req.body)
+    const buffer = await resolveImageBuffer(body.imageUrl)
+    const segments = await callVisionSidecarSamSegment(buffer, body.boxes)
+    return res.json({
+      ok: true,
+      polygons: segments
+        .map((seg) => (Array.isArray(seg?.polygon) ? seg.polygon : []))
+        .filter((poly) => poly.length >= 3),
+      segments,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'SAM refinement failed'
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.message, code: 'VALIDATION' })
     }
@@ -3126,7 +3425,7 @@ app.post('/api/items/embed', async (req, res) => {
     const started = Date.now()
     const payload = buildEmbeddingPayloadFromItem(item)
     const cacheKey = buildEmbeddingCacheKey(item, payload)
-    const existing = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
+    const existing = await readEmbeddingsArray()
     const cached = [...existing].reverse().find((entry) => (
       entry?.item_id === item.id &&
       typeof entry?.cache_key === 'string' &&
@@ -3330,8 +3629,7 @@ app.post('/api/extension/match', async (req, res) => {
       queryEmbeddingModel = 'deterministic-fallback'
     }
 
-    const entriesRaw = JSON.parse(await fs.readFile(embeddingsFile, 'utf8'))
-    const entries = Array.isArray(entriesRaw) ? entriesRaw : []
+    const entries = await readEmbeddingsArray()
     const queryDim = Array.isArray(queryVector) ? queryVector.length : 0
     const compatible = entries.filter((entry) => Array.isArray(entry.vector) && entry.vector.length === queryDim)
     const ranked = compatible

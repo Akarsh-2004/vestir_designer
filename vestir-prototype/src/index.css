@@ -450,10 +450,11 @@ body {
 
 .subject-filter {
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px;
+  border-radius: 16px;
+  padding: 12px;
   margin-bottom: 12px;
   background: #fff;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.05);
 }
 
 .subject-filter__title {
@@ -477,8 +478,9 @@ body {
   border: 1px solid var(--border);
   background: #fff;
   border-radius: 999px;
-  padding: 4px 10px;
+  padding: 6px 11px;
   font-size: 11px;
+  font-weight: 600;
 }
 
 .subject-filter__mode.is-active {
@@ -519,7 +521,8 @@ body {
 }
 
 .subject-filter__chip.is-active {
-  border-color: var(--primary);
+  border-color: #d24d57;
+  background: rgba(210, 77, 87, 0.08);
 }
 
 .subject-filter__image {
@@ -534,11 +537,72 @@ body {
   position: relative;
 }
 
+.subject-filter__busy {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(250, 248, 245, 0.82);
+  backdrop-filter: blur(2px);
+  border-radius: 8px;
+  pointer-events: all;
+  z-index: 5;
+}
+
+.subject-filter__busy-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid rgba(75, 70, 64, 0.18);
+  border-top-color: var(--primary);
+  animation: subject-filter-spin 0.9s linear infinite;
+}
+
+.subject-filter__busy-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cocoa);
+  text-align: center;
+}
+
+.subject-filter__busy-sub {
+  font-size: 11px;
+  opacity: 0.7;
+  color: var(--cocoa);
+  max-width: 240px;
+  text-align: center;
+  line-height: 1.35;
+}
+
+@keyframes subject-filter-spin {
+  to { transform: rotate(360deg); }
+}
+
 .subject-filter__overlay {
   position: absolute;
   inset: 0;
   width: 100%;
   height: calc(100% - 6px);
+  pointer-events: none;
+}
+
+.subject-filter__person-box {
+  fill: transparent;
+  stroke: rgba(75, 70, 64, 0.4);
+  stroke-width: 0.35;
+}
+
+.subject-filter__person-box.is-hovered {
+  stroke-width: 0.55;
+}
+
+.subject-filter__person-box.is-selected {
+  fill: rgba(210, 77, 87, 0.08);
+  stroke: #d24d57;
+  stroke-width: 0.8;
 }
 
 .subject-filter__poly-fill {
@@ -570,7 +634,9 @@ body {
 
 .subject-filter__actions {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
   align-items: center;
 }
 

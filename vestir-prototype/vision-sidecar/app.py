@@ -41,6 +41,12 @@ class FaceDetectRequest(BaseModel):
     image_base64: str
 
 
+class SamSegmentRequest(BaseModel):
+    image_base64: str
+    boxes: list[dict[str, float]] = Field(default_factory=list)
+    balanced: bool = True
+
+
 LABELS = [
     "tshirt",
     "shirt",
@@ -114,6 +120,8 @@ _MODELS_ERROR: str | None = None
 _FACE_MODEL = None
 _FACE_MODEL_ERROR: str | None = None
 _FASHION_COLOR_ENTRIES: list | None = None
+_SAM_PREDICTOR: Any | None = None
+_SAM_ERROR: str | None = None
 
 
 def _load_models() -> HybridInferModels:
@@ -581,6 +589,133 @@ def _decode_image(image_base64: str) -> np.ndarray | None:
         return None
 
 
+def _load_sam_predictor():
+    global _SAM_PREDICTOR, _SAM_ERROR
+    if _SAM_PREDICTOR is not None:
+        return _SAM_PREDICTOR
+    if _SAM_ERROR is not None:
+        raise RuntimeError(_SAM_ERROR)
+    try:
+        from segment_anything import SamPredictor, sam_model_registry  # type: ignore
+
+        model_type = (os.environ.get("SAM_MODEL_TYPE", "").strip() or "vit_b").lower()
+        checkpoint = os.environ.get("SAM_CHECKPOINT", "").strip()
+        if not checkpoint:
+            default_checkpoint = os.path.join(os.path.dirname(__file__), "weights", "sam_vit_b_01ec64.pth")
+            if os.path.exists(default_checkpoint):
+                checkpoint = default_checkpoint
+        if not checkpoint:
+            raise RuntimeError("SAM_CHECKPOINT not configured")
+        sam = sam_model_registry[model_type](checkpoint=checkpoint)
+        sam.to(device="cuda" if torch.cuda.is_available() else "cpu")
+        _SAM_PREDICTOR = SamPredictor(sam)
+        return _SAM_PREDICTOR
+    except Exception as exc:  # noqa: BLE001
+        _SAM_ERROR = f"sam_unavailable: {exc}"
+        raise RuntimeError(_SAM_ERROR) from exc
+
+
+def _largest_polygon_from_mask(mask: np.ndarray, width: int, height: int) -> list[dict[str, float]]:
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    contour = max(contours, key=cv2.contourArea)
+    epsilon = 0.003 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    out: list[dict[str, float]] = []
+    for p in approx[:, 0]:
+        x = float(np.clip(p[0] / max(1, width), 0.0, 1.0))
+        y = float(np.clip(p[1] / max(1, height), 0.0, 1.0))
+        out.append({"x": round(x, 4), "y": round(y, 4)})
+    return out
+
+
+def _grabcut_mask_from_bbox(image: np.ndarray, bbox: dict[str, float]) -> np.ndarray:
+    h, w = image.shape[:2]
+    x1 = int(max(0, min(1, float(bbox.get("x1", 0.0)))) * w)
+    y1 = int(max(0, min(1, float(bbox.get("y1", 0.0)))) * h)
+    x2 = int(max(0, min(1, float(bbox.get("x2", 1.0)))) * w)
+    y2 = int(max(0, min(1, float(bbox.get("y2", 1.0)))) * h)
+    x = max(0, min(w - 1, min(x1, x2)))
+    y = max(0, min(h - 1, min(y1, y2)))
+    bw = max(1, abs(x2 - x1))
+    bh = max(1, abs(y2 - y1))
+    rect = (x, y, bw, bh)
+    mask = np.zeros((h, w), np.uint8)
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    cv2.grabCut(image, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    out = np.where((mask == 1) | (mask == 3), 255, 0).astype("uint8")
+    return out
+
+
+def _norm_bbox_to_xyxy(b: dict[str, float], w: int, h: int) -> tuple[int, int, int, int]:
+    x1 = int(max(0, min(1, float(b.get("x1", 0.0)))) * w)
+    y1 = int(max(0, min(1, float(b.get("y1", 0.0)))) * h)
+    x2 = int(max(0, min(1, float(b.get("x2", 1.0)))) * w)
+    y2 = int(max(0, min(1, float(b.get("y2", 1.0)))) * h)
+    return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+
+def _iou_xyxy(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = float((ix2 - ix1) * (iy2 - iy1))
+    ua = float(max(1, (ax2 - ax1) * (ay2 - ay1)) + max(1, (bx2 - bx1) * (by2 - by1)) - inter)
+    return inter / ua
+
+
+def _center_inside(box: tuple[int, int, int, int], region: tuple[int, int, int, int]) -> bool:
+    cx = (box[0] + box[2]) / 2.0
+    cy = (box[1] + box[3]) / 2.0
+    return region[0] <= cx <= region[2] and region[1] <= cy <= region[3]
+
+
+def _yolo_garments_touching_prompt(
+    image: np.ndarray, prompt_xyxy: tuple[int, int, int, int]
+) -> list[tuple[tuple[int, int, int, int], float]]:
+    """Garment pixel boxes overlapping the SAM prompt (IoU or center-in-prompt)."""
+    if not yolov8_configured():
+        return []
+    try:
+        y8 = run_yolov8(image)
+    except Exception:
+        return []
+    if not y8 or not isinstance(y8.get("garments"), list):
+        return []
+    h, w = image.shape[:2]
+    out: list[tuple[tuple[int, int, int, int], float]] = []
+    for g in y8["garments"]:
+        bb = g.get("bbox")
+        if not isinstance(bb, dict):
+            continue
+        box = _norm_bbox_to_xyxy(bb, w, h)
+        if _iou_xyxy(box, prompt_xyxy) < 0.02 and not _center_inside(box, prompt_xyxy):
+            continue
+        conf = float(g.get("confidence", 0.5))
+        out.append((box, conf))
+    return out
+
+
+def _mask_garment_overlap_score(
+    m_bool: np.ndarray, garments: list[tuple[tuple[int, int, int, int], float]]
+) -> float:
+    score = 0.0
+    for box, conf in garments:
+        x1, y1, x2, y2 = box
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(m_bool.shape[1], x2), min(m_bool.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        region = m_bool[y1:y2, x1:x2]
+        score += float(region.sum()) * conf
+    return score
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     models_ok = False
@@ -598,6 +733,8 @@ def health() -> dict[str, Any]:
         "hybrid_infer_ready": models_ok,
         "hybrid_infer_error": model_error,
         "face_model_id": os.environ.get("HF_FACE_MODEL_ID", "").strip() or "arnabdhar/YOLOv8-Face-Detection",
+        "sam_available": _SAM_PREDICTOR is not None and _SAM_ERROR is None,
+        "sam_error": _SAM_ERROR,
     }
 
 
@@ -767,4 +904,78 @@ def detect_faces(payload: FaceDetectRequest) -> dict[str, Any]:
     except Exception:
         faces = _detect_faces_haar(image)
         return {"ok": True, "faces": faces, "backend": "opencv_haar_fallback"}
+
+
+@app.post("/sam/segment")
+def sam_segment(payload: SamSegmentRequest) -> dict[str, Any]:
+    image = _decode_image(payload.image_base64)
+    if image is None:
+        return {"ok": False, "error": "decode_failed", "segments": []}
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return {"ok": False, "error": "invalid_image", "segments": []}
+    segments: list[dict[str, Any]] = []
+    backend = "grabcut_fallback"
+    try:
+        predictor = _load_sam_predictor()
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        predictor.set_image(rgb)
+        for idx, bbox in enumerate(payload.boxes):
+            x1 = float(max(0, min(1, bbox.get("x1", 0.0))) * w)
+            y1 = float(max(0, min(1, bbox.get("y1", 0.0))) * h)
+            x2 = float(max(0, min(1, bbox.get("x2", 1.0))) * w)
+            y2 = float(max(0, min(1, bbox.get("y2", 1.0))) * h)
+            input_box = np.array([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)])
+            multimask = bool(payload.balanced)
+            masks, scores, _ = predictor.predict(box=input_box, multimask_output=multimask)
+            scores_np = np.atleast_1d(np.asarray(scores, dtype=np.float64))
+            masks_np = np.asarray(masks)
+            if masks_np.ndim == 2:
+                masks_np = masks_np[np.newaxis, ...]
+            prompt_xyxy = (
+                int(max(0, min(w - 1, input_box[0]))),
+                int(max(0, min(h - 1, input_box[1]))),
+                int(max(1, min(w, input_box[2]))),
+                int(max(1, min(h, input_box[3]))),
+            )
+            garments_hint = _yolo_garments_touching_prompt(image, prompt_xyxy)
+            best_idx = int(np.argmax(scores_np))
+            if garments_hint and masks_np.shape[0] > 1:
+                best_score = -1.0
+                for mi in range(masks_np.shape[0]):
+                    m_bool = masks_np[mi] > 0.5
+                    ov = _mask_garment_overlap_score(m_bool, garments_hint)
+                    if ov > best_score:
+                        best_score = ov
+                        best_idx = mi
+                if best_score <= 0.0:
+                    best_idx = int(np.argmax(scores_np))
+            mask = (masks_np[best_idx].astype(np.uint8) * 255)
+            polygon = _largest_polygon_from_mask(mask, w, h)
+            seg_score = float(scores_np.flat[min(best_idx, max(0, scores_np.size - 1))])
+            segments.append(
+                {
+                    "id": f"seg-{idx+1}",
+                    "score": seg_score,
+                    "bbox": bbox,
+                    "polygon": polygon,
+                }
+            )
+        backend = "sam2"
+    except Exception:
+        for idx, bbox in enumerate(payload.boxes):
+            try:
+                mask = _grabcut_mask_from_bbox(image, bbox)
+                polygon = _largest_polygon_from_mask(mask, w, h)
+            except Exception:
+                polygon = []
+            segments.append(
+                {
+                    "id": f"seg-{idx+1}",
+                    "score": 0.45,
+                    "bbox": bbox,
+                    "polygon": polygon,
+                }
+            )
+    return {"ok": True, "backend": backend, "segments": segments}
 
