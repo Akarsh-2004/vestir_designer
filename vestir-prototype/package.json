@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "smoke:embed": "node scripts/smoke-embedding.mjs",
+    "test:cycle": "node scripts/test-today-cycle.mjs",
     "embed:download": "cd embedding-sidecar && python3 -m pip install -q -r requirements-download.txt && python3 download_models.py"
   },
   "dependencies": {

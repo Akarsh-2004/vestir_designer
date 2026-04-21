@@ -51,6 +51,10 @@ class TryOffRequest(BaseModel):
         description="outfit | ensemble | tshirt | dress | pants | jacket (or free text for custom phrase)",
     )
     seed: int | None = Field(default=None, description="Optional RNG seed")
+    prompt_override: str | None = Field(
+        default=None,
+        description="Full diffusion prompt; FLUX path auto-prefixes TRYOFF when missing.",
+    )
 
 
 _TRYOFF_TARGET_PHRASE: dict[str, str] = {
@@ -679,7 +683,12 @@ def _tryoff_phrase(garment_target: str) -> str:
     return _TRYOFF_TARGET_PHRASE.get(key, garment_target.strip())
 
 
-def _run_tryoff(image_bytes: bytes, garment_target: str, seed: int | None) -> bytes | None:
+def _run_tryoff(
+    image_bytes: bytes,
+    garment_target: str,
+    seed: int | None,
+    prompt_override: str | None = None,
+) -> bytes | None:
     """
     Single-image virtual try-off (garment extraction on white).
     Requires FLUX.2 base + fal/virtual-tryoff-lora (same env as TRYON_*).
@@ -711,14 +720,17 @@ def _run_tryoff(image_bytes: bytes, garment_target: str, seed: int | None) -> by
                 pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
             phrase = _tryoff_phrase(garment_target)
-            prompt = os.environ.get(
-                "TRYOFF_SD_PROMPT",
-                (
-                    f"high-end e-commerce studio product photo of the {phrase}, isolated on pure white background, "
-                    "ghost mannequin / invisible mannequin presentation, three-dimensional drape and natural garment volume, "
-                    "accurate texture weave and stitching, realistic shadows, high micro-detail, no human visible"
-                ),
-            )
+            if prompt_override and prompt_override.strip():
+                prompt = prompt_override.strip()
+            else:
+                prompt = os.environ.get(
+                    "TRYOFF_SD_PROMPT",
+                    (
+                        f"high-end e-commerce studio product photo of the {phrase}, isolated on pure white background, "
+                        "ghost mannequin / invisible mannequin presentation, three-dimensional drape and natural garment volume, "
+                        "accurate texture weave and stitching, realistic shadows, high micro-detail, no human visible"
+                    ),
+                )
             negative = os.environ.get(
                 "TRYOFF_SD_NEGATIVE",
                 (
@@ -792,19 +804,24 @@ def _run_tryoff(image_bytes: bytes, garment_target: str, seed: int | None) -> by
             scale = max_edge / float(max(w, h))
             pil = pil.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
 
-        card_prompt = _tryoff_flux_prompt(garment_target)
-        if card_prompt:
-            prompt = card_prompt
+        if prompt_override and prompt_override.strip():
+            prompt = prompt_override.strip()
+            if not prompt.upper().startswith("TRYOFF"):
+                prompt = "TRYOFF " + prompt
         else:
-            phrase = _tryoff_phrase(garment_target)
-            tpl = os.environ.get(
-                "TRYOFF_PROMPT_TEMPLATE",
-                (
-                    "TRYOFF extract the {phrase} over a white background, product photography style. "
-                    "NO HUMAN VISIBLE (the garments maintain their 3D form like an invisible mannequin)."
-                ),
-            )
-            prompt = tpl.format(phrase=phrase) if "{phrase}" in tpl else tpl
+            card_prompt = _tryoff_flux_prompt(garment_target)
+            if card_prompt:
+                prompt = card_prompt
+            else:
+                phrase = _tryoff_phrase(garment_target)
+                tpl = os.environ.get(
+                    "TRYOFF_PROMPT_TEMPLATE",
+                    (
+                        "TRYOFF extract the {phrase} over a white background, product photography style. "
+                        "NO HUMAN VISIBLE (the garments maintain their 3D form like an invisible mannequin)."
+                    ),
+                )
+                prompt = tpl.format(phrase=phrase) if "{phrase}" in tpl else tpl
 
         pipe = _load_tryon_pipe()
         # With accelerate `device_map`, `pipe.device` is often `meta` and `_execution_device` may still resolve to
@@ -932,6 +949,89 @@ def tryon(payload: TryOnRequest) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Mannequin v2 (fully generative pipeline)
+# ---------------------------------------------------------------------------
+
+
+class MannequinV2Request(BaseModel):
+    image_base64: str
+    seed: int | None = None
+    score_threshold: float | None = None
+    num_candidates: int | None = None
+    use_cache: bool = True
+    variant: str = "v2.1-textonly"
+
+
+_MANNEQUIN_V2_PIPELINE = None
+_MANNEQUIN_V2_LOCK = threading.Lock()
+
+
+def _get_mannequin_v2_pipeline():
+    global _MANNEQUIN_V2_PIPELINE
+    if _MANNEQUIN_V2_PIPELINE is not None:
+        return _MANNEQUIN_V2_PIPELINE
+    with _MANNEQUIN_V2_LOCK:
+        if _MANNEQUIN_V2_PIPELINE is None:
+            from mannequin_pipeline import build_default_pipeline, PipelineConfig
+
+            _MANNEQUIN_V2_PIPELINE = build_default_pipeline(
+                config=PipelineConfig(
+                    score_threshold=float(os.environ.get("MANNEQUIN_SCORE_THRESHOLD", "0.55")),
+                    max_retries=int(os.environ.get("MANNEQUIN_MAX_RETRIES", "1")),
+                    num_candidates=int(os.environ.get("MANNEQUIN_NUM_CANDIDATES", "6")),
+                    attribute_confidence_threshold=float(
+                        os.environ.get("MANNEQUIN_ATTR_CONF_THRESHOLD", "0.45")
+                    ),
+                    person_sim_max=float(os.environ.get("MANNEQUIN_PERSON_SIM_MAX", "0.20")),
+                    mannequin_sim_min=float(os.environ.get("MANNEQUIN_MANNEQUIN_SIM_MIN", "0.25")),
+                    human_margin_threshold=float(os.environ.get("MANNEQUIN_HUMAN_MARGIN", "0.05")),
+                    skin_pixel_ratio_max=float(os.environ.get("MANNEQUIN_SKIN_RATIO_MAX", "0.03")),
+                    use_cache=os.environ.get("MANNEQUIN_CACHE", "1") == "1",
+                ),
+            )
+        return _MANNEQUIN_V2_PIPELINE
+
+
+@app.post("/mannequin_v2")
+def mannequin_v2(payload: MannequinV2Request) -> dict[str, Any]:
+    try:
+        raw = base64.b64decode(payload.image_base64)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"invalid_base64: {exc}"}
+    try:
+        pipeline = _get_mannequin_v2_pipeline()
+        if payload.score_threshold is not None:
+            pipeline.config.score_threshold = float(payload.score_threshold)
+        if payload.num_candidates is not None:
+            pipeline.config.num_candidates = max(1, min(8, int(payload.num_candidates)))
+        pipeline.config.use_cache = bool(payload.use_cache)
+        pipeline.config.variant = payload.variant or "v2.1-textonly"
+        result = pipeline.run(raw, seed=payload.seed)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        return {
+            "ok": False,
+            "error": f"pipeline_exception: {exc}",
+            "traceback": traceback.format_exc(),
+        }
+
+    body: dict[str, Any] = {
+        # `ok` means the pipeline ran end-to-end without an unexpected exception.
+        # `has_image` tells the caller whether generation actually produced a result.
+        # When has_image=False AND fallback_recommended=True, the caller is expected
+        # to call the legacy SAM endpoint.
+        "ok": True,
+        "has_image": result.image_bytes is not None,
+        "result_image_base64": (
+            base64.b64encode(result.image_bytes).decode("ascii")
+            if result.image_bytes is not None else None
+        ),
+        **result.to_public_dict(),
+    }
+    return body
+
+
 @app.post("/tryoff")
 def tryoff(payload: TryOffRequest) -> dict[str, Any]:
     try:
@@ -939,7 +1039,7 @@ def tryoff(payload: TryOffRequest) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"invalid_base64: {exc}"}
 
-    result = _run_tryoff(raw, payload.garment_target, payload.seed)
+    result = _run_tryoff(raw, payload.garment_target, payload.seed, payload.prompt_override)
     if result is None:
         return {
             "ok": True,

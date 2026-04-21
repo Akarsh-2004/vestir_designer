@@ -726,6 +726,53 @@ body {
   margin: 0 0 4px;
 }
 
+.detection-card__body {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  text-align: inherit;
+  width: 100%;
+  cursor: pointer;
+  color: inherit;
+}
+
+.detection-card__assignment {
+  padding: 4px 6px 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.detection-card__assignment--warn {
+  background: #fff4e5;
+}
+
+.detection-card__assignment--confirmed {
+  background: #edf7ee;
+}
+
+.detection-card__person-row {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.detection-card__person-chip {
+  font-size: 10px;
+  padding: 3px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: white;
+  cursor: pointer;
+}
+
+.detection-card__person-chip.is-active {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+
 .detection-sheet__actions {
   display: flex;
   gap: 8px;
@@ -797,6 +844,51 @@ body {
   border-left: 3px solid var(--primary);
 }
 
+.outfit-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+@media (min-width: 720px) {
+  .outfit-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.outfit-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.outfit-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.outfit-pieces {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.outfit-piece {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 96px;
+  text-decoration: none;
+  color: inherit;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: white;
+}
+
 .layer-block h3 {
   margin: 10px 0 8px;
 }
@@ -813,6 +905,41 @@ body {
 
 .fit-selected {
   outline: 3px solid var(--primary);
+}
+
+.fmf-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.fmf-reason {
+  font-size: 9px;
+  line-height: 1.2;
+  padding: 2px 5px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: white;
+  white-space: nowrap;
+}
+
+.fmf-reason--good {
+  background: #edf7ee;
+  border-color: #b7dcbd;
+  color: #2f6f3a;
+}
+
+.fmf-reason--warn {
+  background: #fff4e5;
+  border-color: #f0d2a4;
+  color: #8a5a1f;
+}
+
+.fmf-reason--bad {
+  background: #fde7ea;
+  border-color: #f0b7bd;
+  color: #8a1f2a;
 }
 
 .danger-link {

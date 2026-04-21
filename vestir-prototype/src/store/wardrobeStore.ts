@@ -14,15 +14,20 @@ import type {
 } from '../types/index'
 import {
   applyManualBlur,
+  cutPolygonAsGarmentAdapter,
   defaultPipelineAdapters,
   detectItemsFromImage,
   embeddingAdapter,
   generateMannequinImage,
+  type MannequinContext,
   reasoningAdapter,
+  refineMaskWithSam,
   runTryoffExtraction,
+  postPipelineSuggestionAdapter,
   type TryoffGarmentTarget,
 } from '../lib/pipeline/adapters'
 import { processItemPipeline } from '../lib/pipeline/orchestrator'
+import type { PostPipelineSuggestionResult, StyleProfile, WeatherContext } from '../lib/pipeline/contracts'
 
 interface WardrobeStore {
   wardrobes: Wardrobe[]
@@ -41,6 +46,9 @@ interface WardrobeStore {
   subjectFilterMaskPolygon: Array<{ x: number; y: number }>
   editorHistoryPast: EditorSnapshot[]
   editorHistoryFuture: EditorSnapshot[]
+  styleProfile: StyleProfile
+  weatherContext: WeatherContext
+  itemSuggestions: Record<string, PostPipelineSuggestionResult | undefined>
   setActiveWardrobe: (id: string) => void
   setActiveCategory: (cat: Category | 'All') => void
   setActiveView: (view: ActiveView) => void
@@ -59,9 +67,35 @@ interface WardrobeStore {
   undoEditorState: () => void
   redoEditorState: () => void
   applySubjectFilter: () => Promise<DetectionResult | null>
+  /**
+   * Cut the active polygon out as a *single* garment card and append it to the
+   * pending detection. Useful when one person wears multiple garments (e.g. top +
+   * pants) and the auto-detector collapses them into one region — the user draws
+   * one polygon per garment, each call here produces one garment card.
+   */
+  cutGarmentFromActivePolygon: (labelHint?: string) => Promise<DetectedGarment | null>
+  /**
+   * Runs SAM on every detected garment's bbox (or the currently selected subset)
+   * and replaces its crop_url with an alpha-PNG cutout, so each detection card
+   * renders as an isolated item with no background. Skips garments that already
+   * have `background_removed: true` or lack a bbox.
+   *
+   * Also returns a map of garment_id → polygon so callers (the review sheet)
+   * can render SAM-style colored mask overlays on the canvas.
+   *
+   * Reports progress via the onProgress callback so the UI can show "1/3 cleaned..."
+   */
+  refineDetectedGarmentBackgrounds: (
+    options?: { onlySelected?: boolean; onProgress?: (done: number, total: number, label: string) => void },
+  ) => Promise<{
+    refined: number
+    skipped: number
+    failed: number
+    polygons: Record<string, Array<{ x: number; y: number }>>
+  }>
   applyManualBlurToPending: (boxes: NormalizedBBox[]) => Promise<DetectionResult | null>
   /** Returns updated detection, or `null` if nothing pending. Throws on mannequin API failure (so the UI never treats an error object as success during HMR). */
-  generateMannequinToPending: () => Promise<DetectionResult | null>
+  generateMannequinToPending: (context?: MannequinContext) => Promise<DetectionResult | null>
   /** FLUX try-off on current pending image (e.g. after blur), then re-run detection on the product shot. */
   applyTryoffExtractionToPending: (
     garmentTarget: TryoffGarmentTarget,
@@ -76,6 +110,7 @@ interface WardrobeStore {
   runHybridAiPipeline: () => Promise<void>
   /** After fixing type/category on an item that blocked embedding, run embed + reasoning. */
   completeAttributeReview: (itemId: string) => Promise<void>
+  refreshPostPipelineSuggestions: (itemId: string) => Promise<void>
 }
 
 type EditorSnapshot = {
@@ -192,6 +227,12 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   subjectFilterMaskPolygon: [],
   editorHistoryPast: [],
   editorHistoryFuture: [],
+  styleProfile: {
+    style_intent: 'balanced',
+    aesthetic_keywords: ['clean', 'minimal', 'modern'],
+  },
+  weatherContext: { mode: 'all' },
+  itemSuggestions: {},
 
   setActiveWardrobe: (id) => set({ activeWardrobeId: id }),
   setActiveCategory: (cat) => set({ activeCategory: cat }),
@@ -378,6 +419,135 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
     return result
   },
 
+  cutGarmentFromActivePolygon: async (labelHint) => {
+    const {
+      pendingDetectionImageUrl,
+      pendingDetection,
+      subjectFilterMaskPolygon,
+    } = get()
+    if (!pendingDetectionImageUrl || !pendingDetection) return null
+    if (subjectFilterMaskPolygon.length < 3) return null
+
+    // Compute polygon bbox + coverage for the synthetic DetectedGarment metadata.
+    const xs = subjectFilterMaskPolygon.map((p) => p.x)
+    const ys = subjectFilterMaskPolygon.map((p) => p.y)
+    const bbox = {
+      x1: Math.max(0, Math.min(...xs)),
+      y1: Math.max(0, Math.min(...ys)),
+      x2: Math.min(1, Math.max(...xs)),
+      y2: Math.min(1, Math.max(...ys)),
+    }
+    const coverage = Math.max(0, Math.min(1, (bbox.x2 - bbox.x1) * (bbox.y2 - bbox.y1)))
+    if (coverage > 0.97) {
+      // Near-full-frame polygon → user almost certainly did not refine it down to one garment.
+      throw new Error(
+        'Polygon covers nearly the whole frame. Draw a tighter outline around just one garment (e.g. the top) and try again.',
+      )
+    }
+
+    const before = snapshotFromState(get())
+    const result = await cutPolygonAsGarmentAdapter(pendingDetectionImageUrl, subjectFilterMaskPolygon)
+    const rel = result.processedImageUrl
+    const cropUrl = rel.startsWith('http') ? rel : `${import.meta.env.VITE_API_BASE_URL ?? ''}${rel}`
+
+    const newGarment: DetectedGarment = {
+      id: crypto.randomUUID(),
+      label: (labelHint ?? 'garment').trim() || 'garment',
+      confidence: 0.95,
+      crop_url: cropUrl,
+      coverage,
+      centrality: 1 - Math.hypot((bbox.x1 + bbox.x2) / 2 - 0.5, (bbox.y1 + bbox.y2) / 2 - 0.5),
+      salience: Math.max(0.1, Math.min(1, coverage * 2)),
+      is_hero: false,
+      partially_visible: false,
+      warning: undefined,
+    }
+
+    const detected = [...pendingDetection.detected, newGarment]
+    const nextSelections = new Set(get().pendingDetectionSelections)
+    nextSelections.add(newGarment.id)
+
+    set({
+      pendingDetection: { ...pendingDetection, detected },
+      pendingDetectionSelections: nextSelections,
+      // Clear the active polygon so the user can immediately draw the next garment.
+      subjectFilterMaskPolygon: [],
+      editorHistoryPast: [...get().editorHistoryPast, before].slice(-30),
+      editorHistoryFuture: [],
+    })
+
+    return newGarment
+  },
+
+  refineDetectedGarmentBackgrounds: async (options) => {
+    const { pendingDetection, pendingDetectionImageUrl, pendingDetectionSelections } = get()
+    if (!pendingDetection || !pendingDetectionImageUrl) {
+      return { refined: 0, skipped: 0, failed: 0, polygons: {} }
+    }
+    const onlySelected = options?.onlySelected ?? true
+    const onProgress = options?.onProgress
+
+    const candidates = pendingDetection.detected.filter((g) => {
+      if (g.background_removed) return false
+      if (!g.bbox) return false
+      if (onlySelected && !pendingDetectionSelections.has(g.id)) return false
+      return true
+    })
+    if (candidates.length === 0) {
+      return { refined: 0, skipped: pendingDetection.detected.length, failed: 0, polygons: {} }
+    }
+
+    const before = snapshotFromState(get())
+    let refined = 0
+    let failed = 0
+    const updatedById: Record<string, DetectedGarment> = {}
+    const polygonsById: Record<string, Array<{ x: number; y: number }>> = {}
+
+    for (let i = 0; i < candidates.length; i++) {
+      const g = candidates[i]
+      onProgress?.(i, candidates.length, g.label)
+      try {
+        const polygons = await refineMaskWithSam(pendingDetectionImageUrl, [g.bbox!])
+        const best = (polygons ?? []).filter((p) => p.length >= 3).sort((a, b) => a.length - b.length)[0]
+        if (!best) {
+          failed += 1
+          continue
+        }
+        polygonsById[g.id] = best
+        const result = await cutPolygonAsGarmentAdapter(pendingDetectionImageUrl, best)
+        const rel = result.processedImageUrl
+        const cleanUrl = rel.startsWith('http') ? rel : `${import.meta.env.VITE_API_BASE_URL ?? ''}${rel}`
+        updatedById[g.id] = {
+          ...g,
+          crop_url: cleanUrl,
+          background_removed: true,
+          warning: g.warning,
+        }
+        refined += 1
+      } catch {
+        failed += 1
+      }
+    }
+    onProgress?.(candidates.length, candidates.length, 'done')
+
+    if (refined === 0) {
+      return { refined: 0, skipped: candidates.length - failed, failed, polygons: polygonsById }
+    }
+
+    const nextDetected = pendingDetection.detected.map((g) => updatedById[g.id] ?? g)
+    set({
+      pendingDetection: { ...pendingDetection, detected: nextDetected },
+      editorHistoryPast: [...get().editorHistoryPast, before].slice(-30),
+      editorHistoryFuture: [],
+    })
+    return {
+      refined,
+      skipped: pendingDetection.detected.length - candidates.length,
+      failed,
+      polygons: polygonsById,
+    }
+  },
+
   applyManualBlurToPending: async (boxes) => {
     const {
       pendingDetectionImageUrl,
@@ -419,7 +589,7 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
     return result
   },
 
-  generateMannequinToPending: async () => {
+  generateMannequinToPending: async (context) => {
     const {
       pendingDetectionImageUrl,
       pendingDetection,
@@ -466,20 +636,34 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
     }
 
     const before = snapshotFromState(get())
+    const selectedLabels = pendingDetection.detected
+      .filter((g) => pendingDetectionSelections.has(g.id))
+      .map((g) => g.label)
     // eslint-disable-next-line no-console
     console.info('[mannequin] cutout request', {
       inputImageUrl: pendingDetectionImageUrl,
       maskPoints: maskPts.length,
       bboxes: fallbackBboxes?.length ?? 0,
       approxMaskArea: approxArea,
+      selectedLabels,
     })
-    const mannequin = await generateMannequinImage(pendingDetectionImageUrl, {
-      mode: subjectFilterMode,
-      selectedPersonIds: Array.from(subjectFilterPersonSelections),
-      selectedPersonBboxes: fallbackBboxes,
-      maskPolygon: maskPts.length >= 1 ? maskPts : undefined,
-      aiAssist: true,
-    })
+    const mannequin = await generateMannequinImage(
+      pendingDetectionImageUrl,
+      {
+        mode: subjectFilterMode,
+        selectedPersonIds: Array.from(subjectFilterPersonSelections),
+        selectedPersonBboxes: fallbackBboxes,
+        maskPolygon: maskPts.length >= 1 ? maskPts : undefined,
+        aiAssist: true,
+      },
+      {
+        selectedLabels,
+        ...context,
+      },
+    )
+    // eslint-disable-next-line no-console
+    console.info('[mannequin] pipeline', mannequin.pipeline)
+    const generativeStage = mannequin.pipeline?.stages?.find((s) => s.id === 'generative_reconstruction')
     if (!mannequin.mannequinImageUrl) {
       throw new Error('Server did not return a mannequin image URL.')
     }
@@ -532,7 +716,9 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
         warnings: [
           ...((detected ?? pendingDetection).warnings ?? []),
           ...reDetectWarnings,
-          'Mannequin preview generated from selected SAM region.',
+          mannequin.pipeline?.diffusion_refined
+            ? 'Mannequin preview: SAM region + diffusion ghost-mannequin refine.'
+            : `Mannequin preview: using SAM cutout fallback (${generativeStage?.detail ?? 'diffusion unavailable'}).`,
         ],
       },
       pendingDetectionSelections: heroSelections,
@@ -644,8 +830,8 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
       editorHistoryFuture: [],
     }))
     await Promise.all(
-      pending.map((item) =>
-        processItemPipeline(item, {
+      pending.map(async (item) => {
+        await processItemPipeline(item, {
           adapters: defaultPipelineAdapters,
           onStageUpdate: (update) => {
             get().updateItem(update.itemId, {
@@ -655,8 +841,9 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
               processing_progress: update.progress,
             })
           },
-        }),
-      ),
+        })
+        await get().refreshPostPipelineSuggestions(item.id)
+      }),
     )
   },
 
@@ -701,8 +888,8 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   runHybridAiPipeline: async () => {
     const pending = get().items.filter((i) => !i.ai_processed && i.processing_status !== 'running')
     await Promise.all(
-      pending.map((item) =>
-        processItemPipeline(item, {
+      pending.map(async (item) => {
+        await processItemPipeline(item, {
           adapters: defaultPipelineAdapters,
           onStageUpdate: (update) => {
             get().updateItem(update.itemId, {
@@ -712,8 +899,9 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
               processing_progress: update.progress,
             })
           },
-        }),
-      ),
+        })
+        await get().refreshPostPipelineSuggestions(item.id)
+      }),
     )
   },
 
@@ -747,12 +935,53 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
           2,
         ),
       })
+      await get().refreshPostPipelineSuggestions(itemId)
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Embedding failed'
       get().updateItem(itemId, {
         processing_status: 'failed',
         processing_error: msg,
       })
+    }
+  },
+
+  refreshPostPipelineSuggestions: async (itemId: string) => {
+    const state = get()
+    const anchor = state.items.find((i) => i.id === itemId && !i.deleted_at)
+    if (!anchor || !anchor.ai_processed) return
+    const wardrobeItems = state.items.filter((i) => i.ai_processed && !i.deleted_at)
+    try {
+      const suggestions = await postPipelineSuggestionAdapter(
+        anchor,
+        wardrobeItems,
+        state.styleProfile,
+        state.weatherContext,
+      )
+      set((current) => ({
+        itemSuggestions: {
+          ...current.itemSuggestions,
+          [itemId]: suggestions,
+        },
+      }))
+    } catch (error) {
+      const fallback: PostPipelineSuggestionResult = {
+        summary: 'Suggestions temporarily unavailable; using your last compatible wardrobe context.',
+        suggestions: [],
+        metadata: {
+          provider: 'client-fallback',
+          model: 'none',
+          source: 'cache-fallback',
+          latency_ms: 0,
+          version: '1.0.0',
+        },
+        warning: error instanceof Error ? error.message : 'Suggestion request failed',
+      }
+      set((current) => ({
+        itemSuggestions: {
+          ...current.itemSuggestions,
+          [itemId]: current.itemSuggestions[itemId] ?? fallback,
+        },
+      }))
     }
   },
 }))

@@ -10,6 +10,7 @@ import {
   reasoningAdapter,
 } from '../../lib/pipeline/adapters'
 import { useWardrobeStore } from '../../store/wardrobeStore'
+import { FIT_LABELS, type FitLabel } from '../../types/index'
 
 function parseRawAttributes(raw?: string) {
   if (!raw) return null
@@ -48,6 +49,8 @@ export function ItemDetailScreen() {
   const deleteItem = useWardrobeStore((s) => s.deleteItem)
   const updateItem = useWardrobeStore((s) => s.updateItem)
   const completeAttributeReview = useWardrobeStore((s) => s.completeAttributeReview)
+  const itemSuggestions = useWardrobeStore((s) => s.itemSuggestions[item?.id ?? ''])
+  const refreshPostPipelineSuggestions = useWardrobeStore((s) => s.refreshPostPipelineSuggestions)
   const [advancedRunning, setAdvancedRunning] = useState(false)
   const [embedBusy, setEmbedBusy] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -56,6 +59,7 @@ export function ItemDetailScreen() {
   const [editedColor, setEditedColor] = useState('')
   const [editedMaterial, setEditedMaterial] = useState('')
   const [editedPattern, setEditedPattern] = useState('')
+  const [editedFit, setEditedFit] = useState<'' | FitLabel>('')
 
   const parsedAttrs = useMemo(() => parseRawAttributes(item?.raw_attributes), [item?.raw_attributes])
   const aiNotes = useMemo(() => {
@@ -90,6 +94,7 @@ export function ItemDetailScreen() {
     setEditedColor(item.color_primary ?? '')
     setEditedMaterial(item.material ?? '')
     setEditedPattern(item.pattern ?? '')
+    setEditedFit(item.fit ?? '')
   }, [item?.id])
 
   if (!item) return <div className="card">This item isn’t here anymore.</div>
@@ -203,6 +208,12 @@ export function ItemDetailScreen() {
             <input value={editedColor} onChange={(e) => setEditedColor(e.target.value)} placeholder="Primary color" />
             <input value={editedMaterial} onChange={(e) => setEditedMaterial(e.target.value)} placeholder="Material" />
             <input value={editedPattern} onChange={(e) => setEditedPattern(e.target.value)} placeholder="Pattern" />
+            <select value={editedFit} onChange={(e) => setEditedFit(e.target.value as '' | FitLabel)}>
+              <option value="">Fit (unspecified)</option>
+              {FIT_LABELS.map((f) => (
+                <option key={f} value={f}>{f}</option>
+              ))}
+            </select>
             <div style={{ display: 'flex', gap: 8 }}>
               <button
                 className="btn secondary"
@@ -214,6 +225,7 @@ export function ItemDetailScreen() {
                     color_primary: editedColor.trim() || item.color_primary,
                     material: editedMaterial.trim() || item.material,
                     pattern: editedPattern.trim() || undefined,
+                    fit: editedFit === '' ? undefined : editedFit,
                     style_tags: Array.from(new Set([...(item.style_tags ?? []), 'UserCorrected'])),
                   })
                   toast.success('Saved correction.')
@@ -327,6 +339,45 @@ export function ItemDetailScreen() {
       <Link className="btn" to={`/finish-my-fit/${item.id}`}>
         Build a look from this
       </Link>
+      {item.ai_processed ? (
+        <Link className="btn" to={`/outfit-suggestions/${item.id}`}>
+          Full outfit ideas
+        </Link>
+      ) : null}
+      {item.ai_processed ? (
+        <button
+          className="btn secondary"
+          type="button"
+          onClick={() => void refreshPostPipelineSuggestions(item.id)}
+        >
+          Refresh AI suggestions
+        </button>
+      ) : null}
+      {itemSuggestions ? (
+        <div className="detail-notes">
+          <strong>Suggested next items</strong>
+          <p className="muted" style={{ margin: '4px 0 8px' }}>{itemSuggestions.summary}</p>
+          <ul className="detail-notes-list">
+            {itemSuggestions.suggestions.slice(0, 3).map((s) => (
+              <li key={s.item_id}>
+                {Math.round(s.score * 100)}% match · {s.explanation}
+              </li>
+            ))}
+            {itemSuggestions.suggestions.length === 0 ? (
+              <li>{itemSuggestions.warning ?? 'No suggestions available yet.'}</li>
+            ) : null}
+          </ul>
+          {itemSuggestions.suggestions.length > 0 ? (
+            <Link
+              className="btn secondary"
+              to={`/finish-my-fit/${item.id}`}
+              state={{ preselectedIds: itemSuggestions.suggestions.map((s) => s.item_id) }}
+            >
+              Open Finish My Fit with suggestions
+            </Link>
+          ) : null}
+        </div>
+      ) : null}
       <button
         className="btn secondary"
         type="button"

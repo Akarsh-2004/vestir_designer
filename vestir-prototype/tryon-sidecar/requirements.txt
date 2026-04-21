@@ -9,3 +9,4 @@ transformers
 accelerate
 safetensors
 huggingface_hub
+google-generativeai

@@ -1,5 +1,8 @@
 export type Category = 'Tops' | 'Bottoms' | 'Outerwear' | 'Shoes' | 'Accessories'
 
+export const FIT_LABELS = ['Slim', 'Regular', 'Relaxed', 'Oversized', 'Cropped', 'Tailored'] as const
+export type FitLabel = (typeof FIT_LABELS)[number]
+
 export interface HSLColor {
   h: number
   s: number
@@ -19,8 +22,8 @@ export interface Item {
   color_primary_hsl: HSLColor
   color_secondary_hsl?: HSLColor
   material: string
-  /** Relaxed / slim / … when inference returns it */
-  fit?: string
+  /** Canonical fit label when inference returns it. */
+  fit?: FitLabel
   pattern?: string
   /** Set when models disagreed; embedding skipped until user confirms (see item detail). */
   attribute_review_pending?: boolean
@@ -74,6 +77,15 @@ export interface DetectedGarment {
   is_hero: boolean
   partially_visible: boolean
   warning?: string
+  /**
+   * Normalized bounding box of the detected garment in the source frame.
+   * Used downstream for per-garment SAM refinement (transparent PNG cutouts)
+   * without re-running Vision. Optional for backwards compatibility with older
+   * detection results that predate this field.
+   */
+  bbox?: NormalizedBBox
+  /** True when crop_url has a transparent background (alpha PNG via SAM/mask). */
+  background_removed?: boolean
 }
 
 export interface NormalizedPoint {
@@ -123,6 +135,12 @@ export interface PipelineStageInfo {
 export interface DetectionResult {
   detected: DetectedGarment[]
   person_candidates?: PersonCandidate[]
+  person_assignments?: Array<{
+    garment_id: string
+    person_id: string | null
+    confidence: number
+    requires_confirmation: boolean
+  }>
   face_candidates?: FaceCandidate[]
   scene_track: 'worn' | 'flat_lay' | 'ambiguous'
   source_image_url: string

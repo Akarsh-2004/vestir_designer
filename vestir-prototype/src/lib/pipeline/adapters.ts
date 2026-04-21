@@ -1,5 +1,16 @@
-import type { EmbeddingResult, InferenceResult, PipelineAdapters, PreprocessResult, ReasoningResult } from './contracts'
-import type { BlurQualityPreset, DetectionResult, Item, NormalizedBBox, SubjectFilterConfig } from '../../types/index'
+import type {
+  EmbeddingResult,
+  InferenceResult,
+  OutfitBuildResult,
+  PipelineAdapters,
+  PostPipelineSuggestionResult,
+  PreprocessResult,
+  ReasoningResult,
+  StyleProfile,
+  WeatherContext,
+} from './contracts'
+import type { BlurQualityPreset, DetectionResult, FitLabel, Item, NormalizedBBox, NormalizedPoint, SubjectFilterConfig } from '../../types/index'
+import { FIT_LABELS } from '../../types/index'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
@@ -38,8 +49,26 @@ export type ManualBlurResult = {
   regionsCount: number
 }
 
+export type MannequinContext = {
+  selectedLabels?: string[]
+  attributeHints?: Record<string, string>
+  garmentTarget?: 'outfit' | 'ensemble' | 'tshirt' | 'dress' | 'pants' | 'jacket'
+}
+
+export type MannequinPipelineMetadata = {
+  version?: string
+  architecture_id?: string
+  stages?: Array<{ id: string; status: string; detail?: string }>
+  catalog_attributes?: Record<string, unknown>
+  generation_prompt?: string
+  diffusion_refined?: boolean
+  garment_target?: string
+  latency_ms?: number
+}
+
 export type MannequinResult = {
   mannequinImageUrl: string | null
+  pipeline?: MannequinPipelineMetadata
 }
 
 export async function refineMaskWithSam(
@@ -61,11 +90,16 @@ export async function refineMaskWithSam(
 export async function generateMannequinImage(
   imageUrl: string,
   subjectFilter: SubjectFilterConfig,
+  context?: MannequinContext,
 ): Promise<MannequinResult> {
   const response = await fetch(`${API_BASE}/api/items/mannequin`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ imageUrl, subjectFilter }),
+    body: JSON.stringify({
+      imageUrl,
+      subjectFilter,
+      ...(context ? { context } : {}),
+    }),
   })
   const data = await readJsonOrThrow(response, 'Mannequin request failed')
   if (!response.ok) {
@@ -85,7 +119,11 @@ export async function generateMannequinImage(
   if (!mannequinImageUrl) {
     throw new Error('Server returned success but no mannequinImageUrl')
   }
-  return { mannequinImageUrl }
+  const pipeline =
+    data.pipeline && typeof data.pipeline === 'object'
+      ? (data.pipeline as MannequinPipelineMetadata)
+      : undefined
+  return { mannequinImageUrl, pipeline }
 }
 
 type ManualBlurRequest = {
@@ -199,14 +237,22 @@ function normalizeSeason(season: InferenceResult['season']) {
   return normalized.length ? normalized : ['spring', 'summer']
 }
 
-function normalizeFit(fit?: string) {
+/**
+ * Map free-form LLM output (e.g. "slim-fit", "tailored cut", "boxy cropped")
+ * into a canonical FitLabel. Returns undefined when no confident match exists
+ * rather than a lossy toTitleCase of unknown text.
+ */
+function normalizeFit(fit?: string): FitLabel | undefined {
   if (!fit?.trim()) return undefined
   const key = fit.trim().toLowerCase()
-  if (key.includes('oversized') || key.includes('oversize')) return 'Oversized'
-  if (key.includes('slim')) return 'Slim'
-  if (key.includes('relaxed')) return 'Relaxed'
-  if (key.includes('regular') || key.includes('classic')) return 'Regular'
-  return toTitleCase(fit)
+  if (key.includes('oversize')) return 'Oversized'
+  if (key.includes('crop')) return 'Cropped'
+  if (key.includes('tailor') || key.includes('fitted')) return 'Tailored'
+  if (key.includes('slim') || key.includes('skinny') || key.includes('athletic')) return 'Slim'
+  if (key.includes('relax') || key.includes('loose') || key.includes('boxy') || key.includes('baggy')) return 'Relaxed'
+  if (key.includes('regular') || key.includes('classic') || key.includes('standard') || key.includes('straight')) return 'Regular'
+  const titled = toTitleCase(fit) as FitLabel
+  return (FIT_LABELS as readonly string[]).includes(titled) ? titled : undefined
 }
 
 function normalizeMaterial(material: string) {
@@ -253,6 +299,19 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 export const localPreprocessAdapter = async (imageUrl: string, subjectFilter?: SubjectFilterConfig): Promise<PreprocessResult> => {
   return postJson<PreprocessResult>('/api/items/preprocess', { imageUrl, subjectFilter })
+}
+
+/**
+ * Cut exactly one garment out of the active image using a single user-drawn polygon.
+ * The server masks the polygon into a transparent PNG (no face-blur / no SAM re-run),
+ * which we can then surface as an extra DetectedGarment card. This is the building
+ * block for "multiple garments on one person" — user draws a polygon per garment.
+ */
+export const cutPolygonAsGarmentAdapter = async (
+  imageUrl: string,
+  maskPolygon: NormalizedPoint[],
+): Promise<PreprocessResult> => {
+  return postJson<PreprocessResult>('/api/items/preprocess', { imageUrl, maskPolygon })
 }
 
 export const geminiInferenceAdapter = async (processedImageUrl: string): Promise<InferenceResult> => {
@@ -360,6 +419,37 @@ export const embeddingAdapter = async (item: Item): Promise<EmbeddingResult> => 
 
 export const reasoningAdapter = async (item: Item): Promise<ReasoningResult> => {
   return postJson<ReasoningResult>('/api/items/reason', { item })
+}
+
+export const postPipelineSuggestionAdapter = async (
+  anchorItem: Item,
+  wardrobeItems: Item[],
+  profile?: StyleProfile,
+  weather?: WeatherContext,
+): Promise<PostPipelineSuggestionResult> => {
+  return postJson<PostPipelineSuggestionResult>('/api/wardrobe/suggest-next', {
+    anchorItem,
+    wardrobeItems,
+    profile,
+    weather,
+    topK: 6,
+  })
+}
+
+export const outfitBuildAdapter = async (
+  anchorItem: Item,
+  wardrobeItems: Item[],
+  profile?: StyleProfile,
+  weather?: WeatherContext,
+  topK = 3,
+): Promise<OutfitBuildResult> => {
+  return postJson<OutfitBuildResult>('/api/wardrobe/outfits/build', {
+    anchorItem,
+    wardrobeItems,
+    profile,
+    weather,
+    topK,
+  })
 }
 
 export const defaultPipelineAdapters: PipelineAdapters = {

@@ -107,6 +107,52 @@ export interface ReasoningResult {
   metadata: PipelineMetadata
 }
 
+export interface StyleProfile {
+  style_intent?: 'balanced' | 'formal' | 'casual' | 'bold'
+  aesthetic_keywords?: string[]
+}
+
+export interface WeatherContext {
+  mode?: 'warm' | 'cold' | 'mild' | 'all'
+  temperature_c?: number
+  condition?: string
+}
+
+export interface PostPipelineSuggestionResult {
+  summary: string
+  suggestions: Array<{
+    item_id: string
+    score: number
+    explanation: string
+  }>
+  metadata: PipelineMetadata & {
+    source?: 'ollama+heuristic' | 'heuristic-only' | 'cache-fallback'
+  }
+  warning?: string
+}
+
+export type OutfitBuildPiece = Item
+
+export interface OutfitBuildResult {
+  anchor_item: Item
+  outfits: Array<{
+    rank: number
+    score: number
+    min_pair_score: number
+    avg_pair_score: number
+    explanation: string
+    pieces: OutfitBuildPiece[]
+    piece_ids: string[]
+  }>
+  summary: string
+  metadata: PipelineMetadata & {
+    source?: 'ollama+heuristic' | 'heuristic-only'
+    required_slots?: string[]
+    compositions_considered?: number
+    candidate_pool?: number
+  }
+}
+
 export interface StageUpdate {
   itemId: string
   stage: ProcessingStage

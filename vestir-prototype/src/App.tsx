@@ -5,6 +5,7 @@ import Index from './pages/Index'
 import NotFound from './pages/NotFound'
 import { ItemDetailScreen } from './features/items/ItemDetailScreen'
 import { FinishMyFitScreen } from './features/finish-my-fit/FinishMyFitScreen'
+import { OutfitSuggestionsScreen } from './features/outfit-suggestions/OutfitSuggestionsScreen'
 import { SettingsScreen } from './features/settings/SettingsScreen'
 import { DetectionReviewSheet } from './features/add-items/DetectionReviewSheet'
 import { useWardrobeStore } from './store/wardrobeStore'
@@ -26,6 +27,7 @@ function App() {
           <Route path="/" element={<Index />} />
           <Route path="/item/:id" element={<ItemDetailScreen />} />
           <Route path="/finish-my-fit/:anchorId" element={<FinishMyFitScreen />} />
+          <Route path="/outfit-suggestions/:anchorId" element={<OutfitSuggestionsScreen />} />
           <Route path="/settings" element={<SettingsScreen />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

@@ -25,6 +25,8 @@ dotenv.config({ path: path.resolve(rootDir, '.env') })
 const storageDir = path.join(rootDir, 'server', 'storage')
 const processedDir = path.join(storageDir, 'processed')
 const embeddingsFile = path.join(storageDir, 'embeddings.json')
+const wardrobeItemsFile = path.join(storageDir, 'wardrobe_items.json')
+const wardrobeCompatibilityFile = path.join(storageDir, 'wardrobe_compatibility.json')
 
 const app = express()
 const port = Number(process.env.API_PORT ?? 8787)
@@ -220,6 +222,7 @@ const subjectFilterSchema = z.object({
 const detectRequestSchema = z.object({
   imageUrl: z.string().min(1),
   subjectFilter: subjectFilterSchema,
+  privacyPolicy: z.enum(['auto', 'strict', 'off']).optional(),
 })
 const preprocessRequestSchema = z.object({
   imageUrl: z.string().min(1),
@@ -227,6 +230,7 @@ const preprocessRequestSchema = z.object({
   maskPolygon: z.array(normalizedPointSchema).min(3).optional(),
   subjectFilter: subjectFilterSchema,
   removeBackground: z.boolean().optional(),
+  privacyPolicy: z.enum(['auto', 'strict', 'off']).optional(),
 })
 const inferRequestSchema = z.object({
   processedImageUrl: z.string().min(1),
@@ -259,6 +263,50 @@ const advancedLocalGemmaSchema = z.object({
 })
 const embedRequestSchema = z.object({ item: z.any() })
 const reasonRequestSchema = z.object({ item: z.any() })
+const wardrobeItemUpsertSchema = z.object({
+  item: z.any(),
+  mannequinImageUrl: z.string().optional(),
+  attributes: z.record(z.any()).optional(),
+})
+const wardrobeCompatibilitySchema = z.object({
+  itemA: z.any(),
+  itemB: z.any(),
+  useLlm: z.boolean().optional(),
+})
+const wardrobeOutfitBuildSchema = z.object({
+  anchorItemId: z.string().optional(),
+  anchorItem: z.any().optional(),
+  wardrobeItems: z.array(z.any()).optional(),
+  topK: z.number().int().min(1).max(10).optional(),
+  useLlm: z.boolean().optional(),
+  profile: z.object({
+    style_intent: z.enum(['balanced', 'formal', 'casual', 'bold']).optional(),
+    aesthetic_keywords: z.array(z.string()).optional(),
+  }).optional(),
+  weather: z.object({
+    mode: z.enum(['warm', 'cold', 'mild', 'all']).optional(),
+    temperature_c: z.number().optional(),
+    condition: z.string().optional(),
+  }).optional(),
+  requireCategories: z.array(z.enum(['Tops', 'Bottoms', 'Outerwear', 'Shoes', 'Accessories'])).optional(),
+})
+const styleProfileSchema = z.object({
+  style_intent: z.enum(['balanced', 'formal', 'casual', 'bold']).optional(),
+  aesthetic_keywords: z.array(z.string()).optional(),
+}).optional()
+const weatherContextSchema = z.object({
+  mode: z.enum(['warm', 'cold', 'mild', 'all']).optional(),
+  temperature_c: z.number().optional(),
+  condition: z.string().optional(),
+}).optional()
+const wardrobeSuggestNextSchema = z.object({
+  anchorItem: z.any(),
+  wardrobeItems: z.array(z.any()).optional(),
+  profile: styleProfileSchema,
+  weather: weatherContextSchema,
+  topK: z.number().int().min(1).max(12).optional(),
+  useLlm: z.boolean().optional(),
+})
 const extensionMatchSchema = z.object({
   imageUrl: z.string().min(1),
   pageUrl: z.string().optional(),
@@ -288,9 +336,19 @@ const manualBlurRequestSchema = z.object({
 }).refine((v) => (v.boxes?.length ?? 0) > 0 || (v.maskPolygon?.length ?? 0) >= 3, {
   message: 'Provide at least one blur box or a polygon mask.',
 })
+const mannequinContextSchema = z
+  .object({
+    /** Vision chip labels from the client (drives category + try-off garment_target). */
+    selectedLabels: z.array(z.string()).optional(),
+    /** User or upstream model hints: collar, sleeves, fabric, etc. */
+    attributeHints: z.record(z.string(), z.string()).optional(),
+    garmentTarget: z.enum(['outfit', 'ensemble', 'tshirt', 'dress', 'pants', 'jacket']).optional(),
+  })
+  .optional()
 const mannequinRequestSchema = z.object({
   imageUrl: z.string().min(1),
   subjectFilter: subjectFilterSchema,
+  context: mannequinContextSchema,
 })
 const samRefineRequestSchema = z.object({
   imageUrl: z.string().min(1),
@@ -314,6 +372,16 @@ async function ensureStorage() {
   } catch {
     await fs.writeFile(embeddingsFile, JSON.stringify([]), 'utf8')
   }
+  try {
+    await fs.access(wardrobeItemsFile)
+  } catch {
+    await fs.writeFile(wardrobeItemsFile, JSON.stringify([]), 'utf8')
+  }
+  try {
+    await fs.access(wardrobeCompatibilityFile)
+  } catch {
+    await fs.writeFile(wardrobeCompatibilityFile, JSON.stringify([]), 'utf8')
+  }
 }
 
 /** Load embedding cache; repair corrupt/truncated JSON so /embed never hard-fails the whole pipeline. */
@@ -334,6 +402,171 @@ async function readEmbeddingsArray() {
     await fs.writeFile(embeddingsFile, JSON.stringify([]), 'utf8')
     console.warn(`[embeddings] Invalid embeddings.json (${reason}). Reset to []. Backup attempted: ${backup}`)
     return []
+  }
+}
+
+async function readJsonArrayFile(filePath) {
+  try {
+    const raw = (await fs.readFile(filePath, 'utf8')).trim()
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+async function writeJsonArrayFile(filePath, data) {
+  await fs.writeFile(filePath, JSON.stringify(Array.isArray(data) ? data : []), 'utf8')
+}
+
+function parseRawAttributes(item) {
+  if (item && typeof item.raw_attributes === 'object' && item.raw_attributes !== null) return item.raw_attributes
+  if (typeof item?.raw_attributes === 'string') {
+    try { return JSON.parse(item.raw_attributes) } catch { return {} }
+  }
+  return {}
+}
+
+function categoryCompatibilityBoost(a, b) {
+  const ca = normText(a?.category)
+  const cb = normText(b?.category)
+  if (!ca || !cb) return 0
+  const pair = `${ca}->${cb}`
+  const accepted = new Set([
+    'tops->bottoms', 'bottoms->tops',
+    'tops->outerwear', 'outerwear->tops',
+    'bottoms->shoes', 'shoes->bottoms',
+    'tops->shoes', 'shoes->tops',
+    'outerwear->bottoms', 'bottoms->outerwear',
+  ])
+  if (ca === cb) return ca === 'accessories' ? 0.03 : -0.08
+  return accepted.has(pair) ? 0.14 : -0.04
+}
+
+function colorHarmonyBoost(a, b) {
+  const fa = colorFamily(a?.color_primary)
+  const fb = colorFamily(b?.color_primary)
+  if (!fa || !fb) return 0
+  if (fa === fb) return 0.08
+  const neutral = new Set(['light-neutral', 'dark-neutral', 'mid-neutral', 'white', 'black', 'grey', 'gray'])
+  if (neutral.has(fa) || neutral.has(fb)) return 0.1
+  const complements = new Set(['blue|brown', 'brown|blue', 'green|brown', 'brown|green', 'red|blue', 'blue|red'])
+  return complements.has(`${fa}|${fb}`) ? 0.06 : 0
+}
+
+function styleOccasionBoost(a, b) {
+  const ar = parseRawAttributes(a)
+  const br = parseRawAttributes(b)
+  const aOcc = new Set(Array.isArray(ar.occasions) ? ar.occasions.map(normText) : [])
+  const bOcc = new Set(Array.isArray(br.occasions) ? br.occasions.map(normText) : [])
+  const overlapOcc = [...aOcc].filter((x) => bOcc.has(x)).length
+  const styleA = normText(ar.style_archetype)
+  const styleB = normText(br.style_archetype)
+  const styleMatch = styleA && styleB && styleA === styleB ? 0.06 : 0
+  return Math.min(0.12, overlapOcc * 0.03 + styleMatch)
+}
+
+function patternPenalty(a, b) {
+  const ar = parseRawAttributes(a)
+  const br = parseRawAttributes(b)
+  const pa = normText(ar.pattern)
+  const pb = normText(br.pattern)
+  if (!pa || !pb) return 0
+  const loud = new Set(['graphic', 'mixed', 'floral', 'plaid', 'check', 'stripe'])
+  if (loud.has(pa) && loud.has(pb) && pa !== pb) return -0.07
+  return 0
+}
+
+function explainHeuristicPairing(a, b, score) {
+  const reasons = []
+  if (categoryCompatibilityBoost(a, b) > 0.1) reasons.push('categories complement each other')
+  if (colorHarmonyBoost(a, b) >= 0.08) reasons.push('colors harmonize well')
+  if (styleOccasionBoost(a, b) > 0.03) reasons.push('style/occasion overlap is strong')
+  if (!reasons.length) reasons.push('embedding similarity indicates a workable match')
+  return `${reasons.join(', ')}.`
+}
+
+async function ensureEmbeddingForItem(item) {
+  const existing = await readEmbeddingsArray()
+  const latest = [...existing].reverse().find((entry) => entry?.item_id === item?.id && Array.isArray(entry?.vector) && entry.vector.length > 0)
+  if (latest) return latest
+
+  const resp = await fetch(`http://127.0.0.1:${port}/api/items/embed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ item }),
+  })
+  if (!resp.ok) {
+    const txt = await resp.text()
+    throw new Error(`embed_failed_${resp.status}: ${txt.slice(0, 300)}`)
+  }
+  const json = await resp.json()
+  const after = await readEmbeddingsArray()
+  const byId = [...after].find((entry) => entry?.id === json?.vector_id)
+  if (byId?.vector?.length) return byId
+  const fallback = [...after].reverse().find((entry) => entry?.item_id === item?.id && Array.isArray(entry?.vector) && entry.vector.length > 0)
+  if (fallback) return fallback
+  throw new Error(`embedding_missing_for_item_${item?.id ?? 'unknown'}`)
+}
+
+function computeCompatibilityHeuristic(itemA, itemB, vectorA, vectorB) {
+  const embeddingScore = cosineSimilarity(vectorA, vectorB)
+  const categoryBoost = categoryCompatibilityBoost(itemA, itemB)
+  const colorBoost = colorHarmonyBoost(itemA, itemB)
+  const styleBoost = styleOccasionBoost(itemA, itemB)
+  const pattPenalty = patternPenalty(itemA, itemB)
+  const score = Math.max(0, Math.min(1, embeddingScore * 0.68 + categoryBoost + colorBoost + styleBoost + pattPenalty))
+  return {
+    score,
+    breakdown: {
+      embedding: Number(embeddingScore.toFixed(4)),
+      category_boost: Number(categoryBoost.toFixed(4)),
+      color_boost: Number(colorBoost.toFixed(4)),
+      style_boost: Number(styleBoost.toFixed(4)),
+      pattern_penalty: Number(pattPenalty.toFixed(4)),
+    },
+  }
+}
+
+async function llmCompatibilityAdjustment(itemA, itemB) {
+  if (!genai) return null
+  const prompt = `Return strict JSON only.
+Rate outfit compatibility for these two wardrobe items on a 0-1 scale.
+
+itemA: ${JSON.stringify({
+  item_type: itemA?.item_type,
+  category: itemA?.category,
+  color_primary: itemA?.color_primary,
+  material: itemA?.material,
+  raw_attributes: parseRawAttributes(itemA),
+})}
+itemB: ${JSON.stringify({
+  item_type: itemB?.item_type,
+  category: itemB?.category,
+  color_primary: itemB?.color_primary,
+  material: itemB?.material,
+  raw_attributes: parseRawAttributes(itemB),
+})}
+
+Schema:
+{"score": number, "explanation": "short reason (<=18 words)"}
+Rules:
+- score in [0,1]
+- prefer practical wearable pairings
+- penalize same-role collisions (top+top, bottom+bottom) unless clearly layering`
+  try {
+    const out = await genai.models.generateContent({
+      model: inferFlashModel,
+      contents: prompt,
+    })
+    const raw = String(out?.text ?? '').trim()
+    const parsed = JSON.parse(extractJsonObject(raw))
+    const score = Math.max(0, Math.min(1, Number(parsed?.score ?? 0.5)))
+    const explanation = String(parsed?.explanation ?? '').trim() || 'LLM assessed moderate compatibility.'
+    return { score, explanation }
+  } catch {
+    return null
   }
 }
 
@@ -516,6 +749,40 @@ async function detectFaces(buffer) {
   if (!faceClient) return []
   const [result] = await faceClient.faceDetection({ image: { content: buffer } })
   return result.faceAnnotations ?? []
+}
+
+/**
+ * Reject face detections that look like false positives on garment text/logos
+ * or on print details. Real faces have:
+ *   - aspect ratio ~0.6–1.5
+ *   - reasonable size (>~1.5% of frame)
+ *   - not tiny clusters sitting deep in the lower torso area of a cropped garment
+ * Keeping this strict avoids blurring things like "CHANEL" text or chest prints.
+ */
+function isLikelyTrueFaceRegion(region, frameWidth, frameHeight) {
+  if (!region || !frameWidth || !frameHeight) return false
+  const w = Math.max(1, Number(region.width ?? 0))
+  const h = Math.max(1, Number(region.height ?? 0))
+  const areaFrac = (w * h) / (frameWidth * frameHeight)
+  if (areaFrac < 0.005) return false
+  if (areaFrac > 0.9) return false
+  const aspect = w / h
+  if (aspect < 0.45 || aspect > 1.9) return false
+  return true
+}
+
+function filterValidFacePixelRegions(regions, frameWidth, frameHeight) {
+  return (regions ?? []).filter((r) => isLikelyTrueFaceRegion(r, frameWidth, frameHeight))
+}
+
+function filterValidFaceCandidates(candidates, frameWidth, frameHeight) {
+  return (candidates ?? []).filter((candidate) => {
+    const bbox = candidate?.bbox
+    if (!bbox) return false
+    const w = Math.max(0, (bbox.x2 - bbox.x1)) * frameWidth
+    const h = Math.max(0, (bbox.y2 - bbox.y1)) * frameHeight
+    return isLikelyTrueFaceRegion({ width: w, height: h }, frameWidth, frameHeight)
+  })
 }
 
 function normalizeBox(box) {
@@ -1826,6 +2093,32 @@ function selectPersonBboxes(subjectFilter, personCandidates = []) {
   return []
 }
 
+function assignGarmentsToPersons(garments = [], personCandidates = []) {
+  if (!personCandidates.length || !garments.length) return []
+  return garments.map((entry) => {
+    const garmentBbox = entry.bbox
+    let best = null
+    for (const person of personCandidates) {
+      const overlap = bboxOverlap(garmentBbox, person.bbox)
+      const gx = (garmentBbox.x1 + garmentBbox.x2) / 2
+      const gy = (garmentBbox.y1 + garmentBbox.y2) / 2
+      const px = (person.bbox.x1 + person.bbox.x2) / 2
+      const py = (person.bbox.y1 + person.bbox.y2) / 2
+      const dist = Math.hypot(gx - px, gy - py)
+      const centerScore = Math.max(0, 1 - dist / 1.2)
+      const confidence = overlap * 0.7 + centerScore * 0.3
+      if (!best || confidence > best.confidence) {
+        best = { person_id: person.id, confidence: Number(confidence.toFixed(3)) }
+      }
+    }
+    return {
+      garment_id: entry.id,
+      ...(best ?? { person_id: null, confidence: 0 }),
+      requires_confirmation: !best || best.confidence < 0.2,
+    }
+  })
+}
+
 function shouldKeepGarmentBySubjectFilter(subjectFilter, garmentBbox, selectedPersonBboxes = []) {
   if (!subjectFilter) return true
   if (Array.isArray(subjectFilter.maskPolygon) && subjectFilter.maskPolygon.length >= 3) {
@@ -1846,7 +2139,10 @@ function buildMaskSvg(width, height, regions = []) {
     return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="white" />`
   }).join('')
   return Buffer.from(
-    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" />${rects}</svg>`,
+    // IMPORTANT: keep background transparent (not black) so downstream `dest-in`
+    // composites can rely on alpha. A solid black background is still opaque,
+    // which previously caused `dest-in` to keep the whole base image.
+    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${rects}</svg>`,
   )
 }
 
@@ -1865,7 +2161,9 @@ function buildPolygonMaskSvg(width, height, polygons = []) {
     })
     .join('')
   return Buffer.from(
-    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" />${shapeSvg}</svg>`,
+    // Same fix as buildMaskSvg: transparent background so the polygon defines
+    // opaque-white alpha for mask-based compositing.
+    `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${shapeSvg}</svg>`,
   )
 }
 
@@ -1992,7 +2290,7 @@ async function cropAndIsolateGarment(buffer, vertices, meta) {
   const cropH = Math.max(1, bottom - top)
   return sharp(buffer)
     .extract({ left, top, width: cropW, height: cropH })
-    .jpeg({ quality: 90 })
+    .png()
     .toBuffer()
 }
 
@@ -2007,7 +2305,7 @@ async function contrastScore(buffer) {
 
 app.post('/api/items/detect', async (req, res) => {
   try {
-    const { imageUrl, subjectFilter } = detectRequestSchema.parse(req.body)
+    const { imageUrl, subjectFilter, privacyPolicy } = detectRequestSchema.parse(req.body)
     const started = Date.now()
     const buffer = await resolveImageBuffer(imageUrl)
 
@@ -2026,8 +2324,10 @@ app.post('/api/items/detect', async (req, res) => {
     const sidecarFaceRegions = sidecarFaces
       .map((f) => normalizedToPixelRegion(f.bbox, w, h))
       .filter(Boolean)
-    const faceRegions = sidecarFaceRegions.length > 0 ? sidecarFaceRegions : gcvFaceRegions
-    const faceCandidates = (sidecarFaces.length > 0
+    const faceRegionsRaw = sidecarFaceRegions.length > 0 ? sidecarFaceRegions : gcvFaceRegions
+    // Reject likely false positives on logos/text before blurring.
+    const faceRegions = filterValidFacePixelRegions(faceRegionsRaw, w, h)
+    const faceCandidatesRaw = (sidecarFaces.length > 0
       ? sidecarFaces.map((f, idx) => ({
         id: `face-${idx + 1}`,
         confidence: Number(Number(f.confidence ?? 0.7).toFixed(3)),
@@ -2045,6 +2345,7 @@ app.post('/api/items/detect', async (req, res) => {
         },
         source: 'google-vision',
       })))
+    const faceCandidates = filterValidFaceCandidates(faceCandidatesRaw, w, h)
     const selfieMode = faceRegions.length > 0 && (faceRegions.reduce((sum, r) => sum + (r.width * r.height), 0) / (w * h)) >= 0.25
 
     const sidecar = await callVisionSidecarAnalyze(buffer)
@@ -2062,8 +2363,10 @@ app.post('/api/items/detect', async (req, res) => {
       objectResult = r.localizedObjectAnnotations ?? []
     }
 
+    const forcePrivacy = (privacyPolicy ?? 'auto') === 'strict'
+    const shouldBlur = (privacyPolicy ?? 'auto') !== 'off' && faceRegions.length > 0
     const { output: privacyBuffer, faceBlurApplied } =
-      faceRegions.length > 0 ? await blurFaceRegions(buffer, faceRegions) : { output: buffer, faceBlurApplied: false }
+      shouldBlur ? await blurFaceRegions(buffer, faceRegions) : { output: buffer, faceBlurApplied: false }
 
     const personLike = objectResult.filter((obj) => {
       const nameLc = (obj.name ?? '').toLowerCase()
@@ -2143,7 +2446,7 @@ app.post('/api/items/detect', async (req, res) => {
         const salience = salienceScore({ coverage, centrality, contrast }) * lowerFrameBias * topwearBoost * accessoryPenalty
         const partiallyVisible = coverage < 0.06
 
-        const filename = `${crypto.randomUUID()}.jpg`
+        const filename = `${crypto.randomUUID()}.png`
         await fs.writeFile(path.join(processedDir, filename), cropBuffer)
 
         return {
@@ -2178,8 +2481,16 @@ app.post('/api/items/detect', async (req, res) => {
           is_hero: idx === heroIdx,
           partially_visible: entry.partiallyVisible,
           warning: entry.partiallyVisible ? 'Only partial garment visible — full analysis limited.' : undefined,
+          bbox: {
+            x1: Number(entry.bbox.x1.toFixed(4)),
+            y1: Number(entry.bbox.y1.toFixed(4)),
+            x2: Number(entry.bbox.x2.toFixed(4)),
+            y2: Number(entry.bbox.y2.toFixed(4)),
+          },
+          background_removed: false,
         }))
     }
+    const personAssignments = assignGarmentsToPersons(items.map((it, idx) => ({ ...it, bbox: sorted[idx]?.bbox })), personCandidates)
 
     const faceCount = rawFaces.length
     const maxCoverage = sorted[0]?.coverage ?? 0
@@ -2202,6 +2513,9 @@ app.post('/api/items/detect', async (req, res) => {
       ...(validation.warnings ?? []),
       ...(selfieMode ? ['Selfie-mode activated: face-dominant frame, garment salience re-weighted.'] : []),
       ...(multiPerson ? ['Multiple people in frame — crops are per detected garment; verify each selection.'] : []),
+      ...(personAssignments.some((a) => a.requires_confirmation)
+        ? ['Some garment-to-person links are low confidence. Confirm selections in the review sheet.']
+        : []),
       ...(sidecar ? [] : ['Vision sidecar unavailable — advanced garment parsing skipped.']),
       ...subjectFilteringWarnings,
       ...(fallback ? ['No garment found in this photo. Try closer framing or better lighting.'] : []),
@@ -2210,12 +2524,13 @@ app.post('/api/items/detect', async (req, res) => {
     res.json({
       detected: items,
       person_candidates: personCandidates,
+      person_assignments: personAssignments,
       face_candidates: faceCandidates,
       scene_track: track,
       source_image_url: `/storage/processed/${sourceFilename}`,
       source_image_stage: sourceStage,
       auto_blurred_image_url: autoBlurUrl,
-      manual_blur_required: faceCandidates.length > 0 && !faceBlurApplied,
+      manual_blur_required: (forcePrivacy || faceCandidates.length > 0) && !faceBlurApplied,
       applied_subject_filter: appliedSubjectFilter,
       warnings,
       pipeline: {
@@ -2422,6 +2737,137 @@ app.post('/api/items/blur-manual', async (req, res) => {
   }
 })
 
+function garmentTargetFromMannequinLabels(labels) {
+  if (!Array.isArray(labels) || labels.length === 0) return 'outfit'
+  const haystack = labels.join(' ').toLowerCase()
+  if (/\b(pants|jeans|trousers?)\b/.test(haystack)) return 'pants'
+  if (/\b(dress|gown)\b/.test(haystack)) return 'dress'
+  if (/\b(jacket|coat|blazer|hoodie|outerwear)\b/.test(haystack)) return 'jacket'
+  if (/\b(shirt|tee|t-?shirt|kurta|top|blouse|sweater)\b/.test(haystack)) return 'tshirt'
+  return 'outfit'
+}
+
+function rgbToApproxColorName(r, g, b) {
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  const l = (max + min) / 510
+  const d = max - min || 1e-6
+  if (l < 0.08) return 'black'
+  if (l > 0.92 && d < 30) return 'white'
+  if (d < 22) return l > 0.55 ? 'light gray' : 'charcoal'
+  let h = 0
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6
+  else if (max === g) h = ((b - r) / d + 2) / 6
+  else h = ((r - g) / d + 4) / 6
+  if (h < 0.02 || h >= 0.98) return l < 0.45 ? 'deep red' : 'red'
+  if (h < 0.08) return 'orange'
+  if (h < 0.17) return 'yellow'
+  if (h < 0.22) return 'olive'
+  if (h < 0.33) return 'green'
+  if (h < 0.45) return 'teal'
+  if (h < 0.55) return l < 0.42 ? 'navy blue' : 'blue'
+  if (h < 0.7) return 'indigo'
+  if (h < 0.85) return 'purple'
+  return l > 0.55 ? 'pink' : 'magenta'
+}
+
+async function averageRgbFromImageBuffer(buffer) {
+  try {
+    const { data, info } = await sharp(buffer)
+      .resize(64, 64, { fit: 'inside' })
+      .flatten({ background: { r: 255, g: 255, b: 255 } })
+      .raw()
+      .toBuffer({ resolveWithObject: true })
+    const ch = info.channels
+    let r = 0
+    let g = 0
+    let b = 0
+    const n = Math.max(1, data.length / ch)
+    for (let i = 0; i < data.length; i += ch) {
+      r += data[i]
+      g += data[i + 1]
+      b += data[i + 2]
+    }
+    return {
+      r: Math.round(r / n),
+      g: Math.round(g / n),
+      b: Math.round(b / n),
+    }
+  } catch {
+    return { r: 96, g: 96, b: 96 }
+  }
+}
+
+function buildMannequinCatalogAttributes(labels, hints, rgb, colorName) {
+  const category =
+    (hints?.category && String(hints.category).trim()) ||
+    (Array.isArray(labels) && labels[0] ? String(labels[0]).toLowerCase().replace(/\s+/g, '_') : 'garment')
+  const hex = `#${[rgb.r, rgb.g, rgb.b].map((v) => v.toString(16).padStart(2, '0')).join('')}`
+  const detailsRaw = hints?.details ? String(hints.details) : ''
+  const details = detailsRaw
+    ? detailsRaw.split(',').map((s) => s.trim()).filter(Boolean)
+    : []
+  return {
+    category,
+    color: hints?.color || colorName,
+    color_hex_sample: hex,
+    collar: hints?.collar ?? null,
+    sleeves: hints?.sleeves ?? null,
+    placket: hints?.placket ?? null,
+    fit: hints?.fit ?? 'regular',
+    fabric: hints?.fabric ?? null,
+    details,
+    vision_labels: Array.isArray(labels) ? labels : [],
+  }
+}
+
+function buildMannequinGenerationPrompt(attrs) {
+  const cat = attrs.category !== 'garment' ? String(attrs.category).replace(/_/g, ' ') : 'garment'
+  const parts = [
+    'Studio product photograph of',
+    attrs.color || 'the garment',
+    cat,
+  ]
+  if (attrs.collar) parts.push(`${attrs.collar} collar`)
+  if (attrs.sleeves) parts.push(`${attrs.sleeves} sleeves`)
+  if (attrs.placket) parts.push(String(attrs.placket))
+  if (attrs.fabric) parts.push(`${attrs.fabric} fabric`)
+  if (Array.isArray(attrs.details) && attrs.details.length) parts.push(attrs.details.join(', '))
+  parts.push(
+    'on an invisible neutral mannequin, symmetrical front-facing catalog pose, pure white #FFFFFF background, soft diffused studio lighting, soft shadows, high-end e-commerce, no human face or identity, no logos or readable text',
+  )
+  return parts.filter(Boolean).join(', ') + '.'
+}
+
+async function preprocessSourceForMannequin(buffer) {
+  if (process.env.MANNEQUIN_PREPROCESS === '0') return buffer
+  try {
+    return await sharp(buffer)
+      .removeAlpha()
+      .normalize({ lower: 2, upper: 98 })
+      .modulate({ saturation: 1.03, brightness: 1.01 })
+      .toBuffer()
+  } catch {
+    try {
+      return await sharp(buffer).normalize({ lower: 2, upper: 98 }).toBuffer()
+    } catch {
+      return buffer
+    }
+  }
+}
+
+async function postprocessMannequinBuffer(buffer) {
+  if (process.env.MANNEQUIN_POSTPROCESS === '0') return buffer
+  try {
+    return await sharp(buffer)
+      .sharpen({ sigma: 0.65, m1: 1.2, m2: 0.35 })
+      .jpeg({ quality: 92 })
+      .toBuffer()
+  } catch {
+    return buffer
+  }
+}
+
 app.post('/api/items/mannequin', async (req, res) => {
   try {
     const parsed = mannequinRequestSchema.safeParse(req.body)
@@ -2433,7 +2879,9 @@ app.post('/api/items/mannequin', async (req, res) => {
       })
     }
     const body = parsed.data
-    const source = await resolveImageBuffer(body.imageUrl)
+    const started = Date.now()
+    const rawSource = await resolveImageBuffer(body.imageUrl)
+    const source = await preprocessSourceForMannequin(rawSource)
     const meta = await sharp(source).metadata()
     const width = meta.width ?? 1
     const height = meta.height ?? 1
@@ -2441,6 +2889,12 @@ app.post('/api/items/mannequin', async (req, res) => {
       ? body.subjectFilter.selectedPersonBboxes
       : []
     const poly = Array.isArray(body.subjectFilter?.maskPolygon) ? body.subjectFilter.maskPolygon : []
+    const stages = []
+    stages.push({
+      id: 'ingest_preprocess',
+      status: process.env.MANNEQUIN_PREPROCESS === '0' ? 'skipped' : 'completed',
+      detail: 'normalize + mild saturation for detection-friendly contrast',
+    })
     let keepMask = null
     if (poly.length >= 3) {
       keepMask = buildPolygonMaskSvg(width, height, [poly])
@@ -2462,8 +2916,13 @@ app.post('/api/items/mannequin', async (req, res) => {
         },
       })
     }
+    stages.push({
+      id: 'human_garment_region',
+      status: 'completed',
+      detail: poly.length >= 3 ? 'SAM-style polygon mask' : 'axis-aligned subject region',
+    })
     const isolated = await sharp(source).composite([{ input: keepMask, blend: 'dest-in' }]).png().toBuffer()
-    const mannequin = await sharp({
+    const cutoutRgb = await sharp({
       create: {
         width,
         height,
@@ -2474,15 +2933,238 @@ app.post('/api/items/mannequin', async (req, res) => {
       .composite([{ input: isolated, blend: 'over' }])
       .jpeg({ quality: 92 })
       .toBuffer()
+
+    const ctx = body.context ?? {}
+    const labels = ctx.selectedLabels ?? []
+    const hints = ctx.attributeHints ?? {}
+    const rgb = await averageRgbFromImageBuffer(isolated)
+    const colorName = rgbToApproxColorName(rgb.r, rgb.g, rgb.b)
+    const catalogAttributes = buildMannequinCatalogAttributes(labels, hints, rgb, colorName)
+    const generationPrompt = buildMannequinGenerationPrompt(catalogAttributes)
+    stages.push({
+      id: 'semantic_attribute_encoding',
+      status: 'completed',
+      detail: 'structured catalog fields + dominant color sample from masked crop',
+    })
+    stages.push({
+      id: 'prompt_construction',
+      status: 'completed',
+      detail: 'internal studio prompt for optional diffusion refine',
+    })
+
+    let outBuffer = cutoutRgb
+    let diffusionRefined = false
+    const useTryoff = process.env.MANNEQUIN_USE_TRYOFF?.trim() === '1'
+    const garmentTarget = ctx.garmentTarget ?? garmentTargetFromMannequinLabels(labels)
+    if (useTryoff) {
+      stages.push({
+        id: 'generative_reconstruction',
+        status: 'partial',
+        detail: 'calling try-on sidecar /tryoff with attribute-aware prompt',
+      })
+      const mannequinTryoffTimeoutMs = Number(process.env.MANNEQUIN_TRYOFF_TIMEOUT_MS ?? '90000')
+      const tryoff = await runTryoffWithBuffer(cutoutRgb, garmentTarget, undefined, {
+        promptOverride: generationPrompt,
+        timeoutMs: Number.isFinite(mannequinTryoffTimeoutMs) && mannequinTryoffTimeoutMs >= 0
+          ? mannequinTryoffTimeoutMs
+          : 90000,
+      })
+      if (tryoff.implemented && tryoff.resultBuffer) {
+        outBuffer = tryoff.resultBuffer
+        diffusionRefined = true
+        stages[stages.length - 1] = {
+          id: 'generative_reconstruction',
+          status: 'completed',
+          detail: 'diffusion refine (TRYOFF) applied on white-background cutout',
+        }
+      } else {
+        stages[stages.length - 1] = {
+          id: 'generative_reconstruction',
+          status: 'skipped',
+          detail: String(tryoff.message ?? 'tryoff unavailable — sharp cutout retained'),
+        }
+      }
+    } else {
+      stages.push({
+        id: 'generative_reconstruction',
+        status: 'skipped',
+        detail: 'MANNEQUIN_USE_TRYOFF not set to 1 — pixel-accurate masked composite only',
+      })
+    }
+
+    stages.push({
+      id: 'mannequin_composition',
+      status: 'completed',
+      detail: 'neutral white field, identity removed outside mask, standard front-facing crop',
+    })
+
+    const mannequin = await postprocessMannequinBuffer(outBuffer)
+    stages.push({
+      id: 'post_processing',
+      status: process.env.MANNEQUIN_POSTPROCESS === '0' ? 'skipped' : 'completed',
+      detail: 'sharpen + JPEG encode (background already #FFFFFF)',
+    })
+
     const filename = `${crypto.randomUUID()}.jpg`
     await fs.writeFile(path.join(processedDir, filename), mannequin)
-    return res.json({ mannequinImageUrl: `/storage/processed/${filename}` })
+    return res.json({
+      mannequinImageUrl: `/storage/processed/${filename}`,
+      pipeline: {
+        version: '2.0.0',
+        architecture_id: PIPELINE_ARCHITECTURE_ID,
+        stages,
+        catalog_attributes: catalogAttributes,
+        generation_prompt: generationPrompt,
+        diffusion_refined: diffusionRefined,
+        garment_target: garmentTarget,
+        latency_ms: Date.now() - started,
+      },
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mannequin generation failed'
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.message, code: 'VALIDATION' })
     }
     return res.status(400).json({ error: message })
+  }
+})
+
+// Fully generative (text-to-image only) mannequin pipeline.
+// Pipeline: image → caption → attributes → prompt → SDXL/DALL-E → rank → post.
+// If attribute_confidence is low OR every candidate is rejected, the sidecar
+// returns fallback_recommended=true and this route transparently reroutes to
+// the legacy segmentation pipeline (/api/items/mannequin).
+const mannequinV2RequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  seed: z.number().int().optional(),
+  scoreThreshold: z.number().min(0).max(1).optional(),
+  numCandidates: z.number().int().min(1).max(8).optional(),
+  useCache: z.boolean().optional(),
+  variant: z.string().optional(),
+  allowLegacyFallback: z.boolean().optional(),
+})
+
+async function callLegacyMannequinFallback(imageUrl, reason) {
+  const response = await fetch(`http://127.0.0.1:${process.env.PORT || 8787}/api/items/mannequin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, fallbackReason: reason }),
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`legacy_fallback_http_${response.status}: ${text.slice(0, 400)}`)
+  }
+  return response.json()
+}
+
+app.post('/api/items/mannequin-v2', async (req, res) => {
+  const started = Date.now()
+  try {
+    const body = mannequinV2RequestSchema.parse(req.body)
+    const allowFallback = body.allowLegacyFallback ?? true
+    const buffer = await resolveImageBuffer(body.imageUrl)
+    const timeoutMs = Number(process.env.MANNEQUIN_V2_TIMEOUT_MS ?? '180000')
+    const controller = new AbortController()
+    const timeoutId = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null
+    let sidecarJson
+    try {
+      const response = await fetch(`${tryonSidecarUrl}/mannequin_v2`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_base64: buffer.toString('base64'),
+          seed: body.seed,
+          score_threshold: body.scoreThreshold,
+          num_candidates: body.numCandidates,
+          use_cache: body.useCache ?? true,
+          variant: body.variant ?? 'v2.1-textonly',
+        }),
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(`sidecar_http_${response.status}: ${text.slice(0, 400)}`)
+      }
+      sidecarJson = await response.json()
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+    }
+
+    console.info('[mannequin-v2] pipeline stages=%s conf=%s score=%s fallback=%s',
+      JSON.stringify(sidecarJson?.stages?.map?.((s) => [s.id, s.status, s.duration_ms]) ?? []),
+      sidecarJson?.attribute_confidence,
+      sidecarJson?.score,
+      sidecarJson?.fallback_recommended,
+    )
+
+    // Transparent fallback to legacy SAM pipeline when generative path bailed.
+    if (sidecarJson?.fallback_recommended && allowFallback) {
+      try {
+        const legacy = await callLegacyMannequinFallback(
+          body.imageUrl, sidecarJson.fallback_reason || 'v2_fallback',
+        )
+        return res.json({
+          mannequinImageUrl: legacy.mannequinImageUrl,
+          pipeline: {
+            version: 'v2.0.0-generative + legacy_fallback',
+            architecture_id: 'caption-normalize-prompt-sdxl-score-post',
+            used_path: 'legacy_sam_fallback',
+            fallback_reason: sidecarJson.fallback_reason,
+            attribute_confidence: sidecarJson.attribute_confidence,
+            attributes: sidecarJson.attributes,
+            notes: sidecarJson.notes,
+            stages: sidecarJson.stages,
+            legacy_pipeline: legacy.pipeline,
+            latency_ms: Date.now() - started,
+          },
+        })
+      } catch (fallbackErr) {
+        console.warn('[mannequin-v2] legacy fallback failed:', fallbackErr)
+        return res.status(502).json({
+          error: 'both_pipelines_failed',
+          fallback_error: String(fallbackErr),
+          pipeline: sidecarJson,
+        })
+      }
+    }
+
+    if (!sidecarJson?.has_image || !sidecarJson?.result_image_base64) {
+      return res.status(502).json({
+        error: sidecarJson?.fallback_reason || 'mannequin_v2_failed',
+        pipeline: sidecarJson,
+      })
+    }
+
+    const outBuffer = Buffer.from(sidecarJson.result_image_base64, 'base64')
+    const filename = `${crypto.randomUUID()}.jpg`
+    await fs.writeFile(path.join(processedDir, filename), outBuffer)
+
+    return res.json({
+      mannequinImageUrl: `/storage/processed/${filename}`,
+      pipeline: {
+        version: 'v2.0.0-generative',
+        architecture_id: 'caption-normalize-prompt-sdxl-score-post',
+        used_path: 'text_to_image',
+        total_ms: sidecarJson.total_ms,
+        latency_ms: Date.now() - started,
+        cache_hit: sidecarJson.cache_hit,
+        score: sidecarJson.score,
+        attribute_confidence: sidecarJson.attribute_confidence,
+        attributes: sidecarJson.attributes,
+        prompt: sidecarJson.prompt,
+        negative_prompt: sidecarJson.negative_prompt,
+        candidates: sidecarJson.candidates,
+        selected_index: sidecarJson.selected_index,
+        stages: sidecarJson.stages,
+        notes: sidecarJson.notes,
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Mannequin v2 generation failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    return res.status(500).json({ error: message })
   }
 })
 
@@ -2507,13 +3189,21 @@ app.post('/api/items/sam/refine', async (req, res) => {
   }
 })
 
-async function runTryoffWithBuffer(imageBuffer, garmentTarget = 'outfit', seed = undefined) {
+async function runTryoffWithBuffer(imageBuffer, garmentTarget = 'outfit', seed = undefined, tryoffOptions = undefined) {
   const controller = new AbortController()
   // FLUX try-off on CPU/MPS can exceed 5–20+ minutes; default 2h. Set TRYOFF_TIMEOUT_MS=0 to disable abort.
-  const rawTimeout = process.env.TRYOFF_TIMEOUT_MS ?? process.env.TRYON_TIMEOUT_MS ?? '7200000'
-  const timeoutMs = Number(rawTimeout)
+  const configuredTimeoutMs = Number(process.env.TRYOFF_TIMEOUT_MS ?? process.env.TRYON_TIMEOUT_MS ?? '7200000')
+  const requestedTimeoutMs =
+    Number.isFinite(Number(tryoffOptions?.timeoutMs)) && Number(tryoffOptions?.timeoutMs) >= 0
+      ? Number(tryoffOptions?.timeoutMs)
+      : undefined
+  const timeoutMs = requestedTimeoutMs ?? configuredTimeoutMs
   const timeoutId =
     Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null
+  const promptOverride =
+    typeof tryoffOptions?.promptOverride === 'string' && tryoffOptions.promptOverride.trim()
+      ? tryoffOptions.promptOverride.trim()
+      : undefined
   try {
     const sidecarResponse = await fetch(`${tryonSidecarUrl}/tryoff`, {
       method: 'POST',
@@ -2522,6 +3212,7 @@ async function runTryoffWithBuffer(imageBuffer, garmentTarget = 'outfit', seed =
         image_base64: imageBuffer.toString('base64'),
         garment_target: garmentTarget,
         seed,
+        ...(promptOverride ? { prompt_override: promptOverride } : {}),
       }),
       signal: controller.signal,
     })
@@ -2677,7 +3368,7 @@ app.post('/api/tryon/preview', async (req, res) => {
 
 app.post('/api/items/preprocess', async (req, res) => {
   try {
-    const { imageUrl, maskPolygon, subjectFilter, removeBackground } = preprocessRequestSchema.parse(req.body)
+    const { imageUrl, maskPolygon, subjectFilter, removeBackground, privacyPolicy } = preprocessRequestSchema.parse(req.body)
     const started = Date.now()
 
     // Items from /detect are already isolated crops — skip all Vision work.
@@ -2781,9 +3472,14 @@ app.post('/api/items/preprocess', async (req, res) => {
       : undefined
 
     // Track A (worn): blur faces. Track B (flat lay/hanger): skip.
-    const regions = rawFaces.map(extractBounds).filter(Boolean)
+    const metaPre = await sharp(buffer).metadata()
+    const preW = metaPre.width ?? 1
+    const preH = metaPre.height ?? 1
+    const regionsRaw = rawFaces.map(extractBounds).filter(Boolean)
+    // Reject likely false positives (chest logos, text prints) before blur.
+    const regions = filterValidFacePixelRegions(regionsRaw, preW, preH)
     const facesBeforeBlur = regions.length
-    const shouldBlurFaces = track === 'worn' && regions.length > 0
+    const shouldBlurFaces = (privacyPolicy ?? 'auto') !== 'off' && ((track === 'worn' || privacyPolicy === 'strict') && regions.length > 0)
     const { output, faceDetected, faceBlurApplied } = shouldBlurFaces
       ? await blurFaceRegions(buffer, regions)
       : { output: buffer, faceDetected: rawFaces.length > 0, faceBlurApplied: false }
@@ -3536,6 +4232,365 @@ app.post('/api/items/embed', async (req, res) => {
     })
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : 'Embedding failed' })
+  }
+})
+
+app.post('/api/wardrobe/items/upsert', async (req, res) => {
+  try {
+    const { item, mannequinImageUrl, attributes } = wardrobeItemUpsertSchema.parse(req.body)
+    const started = Date.now()
+    if (!item || typeof item !== 'object') {
+      return res.status(400).json({ error: 'item is required' })
+    }
+    const id = String(item.id ?? '').trim() || `item-${crypto.randomUUID()}`
+    const normalized = {
+      ...item,
+      id,
+      raw_attributes: typeof item.raw_attributes === 'string'
+        ? item.raw_attributes
+        : JSON.stringify(item.raw_attributes ?? attributes ?? {}),
+      mannequin_image_url: mannequinImageUrl ?? item.mannequin_image_url ?? null,
+      updated_at: new Date().toISOString(),
+    }
+    const embedding = await ensureEmbeddingForItem(normalized)
+    const items = await readJsonArrayFile(wardrobeItemsFile)
+    const next = [...items.filter((x) => String(x?.id) !== id), {
+      ...normalized,
+      embedding_vector_id: embedding.id,
+      embedding_model: embedding.model ?? null,
+      embedding_dim: Array.isArray(embedding.vector) ? embedding.vector.length : 0,
+      created_at: items.some((x) => String(x?.id) === id)
+        ? items.find((x) => String(x?.id) === id)?.created_at ?? new Date().toISOString()
+        : new Date().toISOString(),
+    }]
+    await writeJsonArrayFile(wardrobeItemsFile, next)
+    return res.json({
+      ok: true,
+      item_id: id,
+      embedding: {
+        vector_id: embedding.id,
+        model: embedding.model ?? null,
+        dim: Array.isArray(embedding.vector) ? embedding.vector.length : 0,
+      },
+      metadata: { latency_ms: Date.now() - started, version: '1.0.0' },
+    })
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'wardrobe upsert failed' })
+  }
+})
+
+app.post('/api/wardrobe/compatibility', async (req, res) => {
+  try {
+    const { itemA, itemB, useLlm } = wardrobeCompatibilitySchema.parse(req.body)
+    const started = Date.now()
+    const embA = await ensureEmbeddingForItem(itemA)
+    const embB = await ensureEmbeddingForItem(itemB)
+    const heuristic = computeCompatibilityHeuristic(itemA, itemB, embA.vector, embB.vector)
+    let score = heuristic.score
+    let explanation = explainHeuristicPairing(itemA, itemB, score)
+    let llm = null
+    if (useLlm ?? true) {
+      llm = await llmCompatibilityAdjustment(itemA, itemB)
+      if (llm) {
+        score = Math.max(0, Math.min(1, heuristic.score * 0.55 + llm.score * 0.45))
+        explanation = llm.explanation
+      }
+    }
+    const record = {
+      id: crypto.randomUUID(),
+      item1: String(itemA?.id ?? ''),
+      item2: String(itemB?.id ?? ''),
+      score: Number(score.toFixed(4)),
+      breakdown: heuristic.breakdown,
+      llm_score: llm ? Number(llm.score.toFixed(4)) : null,
+      explanation,
+      created_at: new Date().toISOString(),
+    }
+    const existing = await readJsonArrayFile(wardrobeCompatibilityFile)
+    existing.push(record)
+    await writeJsonArrayFile(wardrobeCompatibilityFile, existing.slice(-5000))
+    return res.json({
+      compatibility: record,
+      metadata: { latency_ms: Date.now() - started, version: '1.0.0' },
+    })
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'compatibility failed' })
+  }
+})
+
+/**
+ * Compose a full outfit (top + bottom + shoes + optional outerwear/accessory)
+ * from the anchor using top-K alternatives per slot, then rank each composed
+ * outfit with a Finish My Fit v3–style aggregation (min*0.6 + avg*0.4) over
+ * every pair in the outfit. Adds profile/weather boost and an Ollama
+ * explanation when available.
+ */
+app.post('/api/wardrobe/outfits/build', async (req, res) => {
+  try {
+    const body = wardrobeOutfitBuildSchema.parse(req.body)
+    const started = Date.now()
+    const topK = body.topK ?? 3
+    const persisted = await readJsonArrayFile(wardrobeItemsFile)
+    const mergedMap = new Map()
+    for (const it of persisted) mergedMap.set(String(it?.id), it)
+    for (const it of body.wardrobeItems ?? []) mergedMap.set(String(it?.id), it)
+    const allItems = [...mergedMap.values()].filter((x) => x && typeof x === 'object')
+    const anchor =
+      body.anchorItem ?? allItems.find((x) => String(x?.id) === String(body.anchorItemId ?? ''))
+    if (!anchor) {
+      return res
+        .status(400)
+        .json({ error: 'anchor item not found; provide anchorItem or valid anchorItemId' })
+    }
+
+    const anchorCategory = String(anchor?.category ?? 'Tops')
+    const required = body.requireCategories ?? defaultRequiredCategoriesForAnchor(anchorCategory, body.weather?.mode)
+    const pool = allItems.filter((x) => String(x?.id) !== String(anchor?.id) && !x?.deleted_at)
+
+    const embAnchor = await ensureEmbeddingForItem(anchor)
+    if (!Array.isArray(embAnchor?.vector) || embAnchor.vector.length === 0) {
+      return res.status(400).json({ error: 'anchor embedding unavailable; re-run item processing' })
+    }
+
+    // Per-slot candidates sorted by anchor compatibility (cheap first pass).
+    const slotCandidates = {}
+    for (const slot of required) {
+      if (slot === anchorCategory) continue
+      const bySlot = pool.filter((x) => String(x?.category) === slot)
+      const scored = []
+      for (const cand of bySlot) {
+        try {
+          const emb = await ensureEmbeddingForItem(cand)
+          if (!Array.isArray(emb?.vector) || emb.vector.length !== embAnchor.vector.length) continue
+          const heuristic = computeCompatibilityHeuristic(anchor, cand, embAnchor.vector, emb.vector)
+          const boosted = applyProfileAndWeatherBoost(heuristic.score, anchor, cand, body.profile, body.weather)
+          scored.push({ item: cand, anchorScore: boosted })
+        } catch {
+          // skip broken candidate
+        }
+      }
+      scored.sort((a, b) => b.anchorScore - a.anchorScore)
+      // Beam width per slot: enough variety but bounded to keep combinations sane.
+      slotCandidates[slot] = scored.slice(0, 5)
+    }
+
+    // Generate outfit compositions via cartesian product of top-K per slot.
+    const slotsOrdered = required.filter((s) => s !== anchorCategory)
+    const compositions = cartesianSlots(slotsOrdered, slotCandidates).slice(0, 40)
+
+    // Aggregate scores across every pair in each composed outfit.
+    const outfitEvals = []
+    for (const comp of compositions) {
+      const pieces = [anchor, ...comp.map((c) => c.item)]
+      const pairs = []
+      for (let i = 0; i < pieces.length; i++) {
+        for (let j = i + 1; j < pieces.length; j++) {
+          try {
+            const embI = await ensureEmbeddingForItem(pieces[i])
+            const embJ = await ensureEmbeddingForItem(pieces[j])
+            if (
+              !Array.isArray(embI?.vector) ||
+              !Array.isArray(embJ?.vector) ||
+              embI.vector.length !== embJ.vector.length
+            )
+              continue
+            const h = computeCompatibilityHeuristic(pieces[i], pieces[j], embI.vector, embJ.vector)
+            const b = applyProfileAndWeatherBoost(h.score, pieces[i], pieces[j], body.profile, body.weather)
+            pairs.push(b)
+          } catch {
+            // skip broken pair
+          }
+        }
+      }
+      if (!pairs.length) continue
+      const min = Math.min(...pairs)
+      const avg = pairs.reduce((a, b) => a + b, 0) / pairs.length
+      const outfitScore = Math.max(0, Math.min(1, min * 0.6 + avg * 0.4))
+      outfitEvals.push({ pieces, outfitScore, min, avg })
+    }
+
+    outfitEvals.sort((a, b) => b.outfitScore - a.outfitScore)
+    const topOutfits = outfitEvals.slice(0, topK)
+
+    // LLM explanations (single call per outfit; fall back to heuristic).
+    const useLlm = body.useLlm ?? true
+    const outfits = []
+    let usedLlm = false
+    for (let i = 0; i < topOutfits.length; i++) {
+      const ev = topOutfits[i]
+      let explanation = explainOutfitHeuristic(ev.pieces, ev.outfitScore, body.profile, body.weather)
+      if (useLlm) {
+        const llmText = await llmOutfitExplanation(ev.pieces, body.profile, body.weather)
+        if (llmText) {
+          explanation = llmText
+          usedLlm = true
+        }
+      }
+      outfits.push({
+        rank: i + 1,
+        score: Number(ev.outfitScore.toFixed(4)),
+        min_pair_score: Number(ev.min.toFixed(4)),
+        avg_pair_score: Number(ev.avg.toFixed(4)),
+        explanation,
+        pieces: ev.pieces,
+        piece_ids: ev.pieces.map((p) => String(p.id)),
+      })
+    }
+
+    const source = usedLlm ? 'ollama+heuristic' : 'heuristic-only'
+    return res.json({
+      anchor_item: anchor,
+      outfits,
+      summary: outfits.length
+        ? `Composed ${outfits.length} ranked outfit${outfits.length > 1 ? 's' : ''} from your wardrobe.`
+        : 'Not enough wardrobe items to compose a full outfit yet.',
+      metadata: {
+        provider: 'vestir-server',
+        model: usedLlm ? `blend(${ollamaModel})` : 'heuristic',
+        source,
+        required_slots: required,
+        compositions_considered: compositions.length,
+        candidate_pool: pool.length,
+        latency_ms: Date.now() - started,
+        version: '2.0.0',
+      },
+    })
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'outfit generation failed' })
+  }
+})
+
+function defaultRequiredCategoriesForAnchor(anchorCategory, weatherMode) {
+  const base = new Set(['Tops', 'Bottoms', 'Shoes'])
+  base.add(anchorCategory)
+  if ((weatherMode ?? 'all') === 'cold') base.add('Outerwear')
+  return [...base]
+}
+
+function cartesianSlots(slots, slotCandidates) {
+  let acc = [[]]
+  for (const slot of slots) {
+    const options = slotCandidates[slot] ?? []
+    if (!options.length) return []
+    const next = []
+    for (const partial of acc) {
+      for (const opt of options) {
+        next.push([...partial, { slot, ...opt }])
+      }
+    }
+    acc = next
+  }
+  return acc
+}
+
+function explainOutfitHeuristic(pieces, score, profile, weather) {
+  const names = pieces.map((p) => `${p.color_primary ?? ''} ${p.item_type ?? p.category}`.trim()).slice(0, 4)
+  const intent = profile?.style_intent ?? 'balanced'
+  const mode = weather?.mode ?? 'all'
+  const strength =
+    score >= 0.75 ? 'Strong' : score >= 0.6 ? 'Solid' : score >= 0.45 ? 'Workable' : 'Edgy'
+  return `${strength} ${intent} look for ${mode === 'all' ? 'everyday' : mode + ' weather'}: ${names.join(' + ')}.`
+}
+
+async function llmOutfitExplanation(pieces, profile, weather) {
+  if (!genai) return null
+  const payload = pieces.map((p) => ({
+    category: p.category,
+    item_type: p.item_type,
+    color_primary: p.color_primary,
+    material: p.material,
+    pattern: p.pattern,
+    fit: p.fit,
+    formality: p.formality,
+  }))
+  const prompt = `Return strict JSON only.
+Write one concise styling sentence (<=28 words) explaining why this outfit works, mentioning color harmony or formality alignment when relevant.
+Profile: ${JSON.stringify(profile ?? {})}
+Weather: ${JSON.stringify(weather ?? {})}
+Outfit: ${JSON.stringify(payload)}
+
+Schema: {"explanation": "string"}`
+  try {
+    const out = await genai.models.generateContent({ model: inferFlashModel, contents: prompt })
+    const raw = String(out?.text ?? '').trim()
+    const parsed = JSON.parse(extractJsonObject(raw))
+    const text = String(parsed?.explanation ?? '').trim()
+    return text || null
+  } catch {
+    return null
+  }
+}
+
+function applyProfileAndWeatherBoost(baseScore, anchor, candidate, profile, weather) {
+  let score = baseScore
+  const intent = String(profile?.style_intent ?? 'balanced').toLowerCase()
+  if (intent === 'formal' && Number(candidate?.formality ?? 5) >= 7) score += 0.06
+  if (intent === 'casual' && Number(candidate?.formality ?? 5) <= 5) score += 0.06
+  if (intent === 'bold' && (candidate?.pattern || (candidate?.style_tags?.length ?? 0) > 1)) score += 0.05
+  const mode = String(weather?.mode ?? 'all').toLowerCase()
+  const season = Array.isArray(candidate?.season) ? candidate.season.map((s) => String(s).toLowerCase()) : []
+  if (mode === 'warm' && (season.includes('summer') || season.includes('spring'))) score += 0.05
+  if (mode === 'cold' && (season.includes('winter') || season.includes('autumn'))) score += 0.05
+  return Math.max(0, Math.min(1, score))
+}
+
+app.post('/api/wardrobe/suggest-next', async (req, res) => {
+  try {
+    const body = wardrobeSuggestNextSchema.parse(req.body)
+    const started = Date.now()
+    const persisted = await readJsonArrayFile(wardrobeItemsFile)
+    const mergedMap = new Map()
+    for (const it of persisted) mergedMap.set(String(it?.id), it)
+    for (const it of body.wardrobeItems ?? []) mergedMap.set(String(it?.id), it)
+    const anchor = body.anchorItem
+    const allItems = [...mergedMap.values()].filter((x) => x && typeof x === 'object' && String(x?.id) !== String(anchor?.id))
+    const embAnchor = await ensureEmbeddingForItem(anchor)
+    const scored = []
+    for (const cand of allItems) {
+      try {
+        const emb = await ensureEmbeddingForItem(cand)
+        if (!Array.isArray(emb.vector) || emb.vector.length !== embAnchor.vector.length) continue
+        const heuristic = computeCompatibilityHeuristic(anchor, cand, embAnchor.vector, emb.vector)
+        let finalScore = heuristic.score
+        let explanation = explainHeuristicPairing(anchor, cand, heuristic.score)
+        let llmScore = null
+        if (body.useLlm ?? true) {
+          const llm = await llmCompatibilityAdjustment(anchor, cand)
+          if (llm) {
+            llmScore = llm.score
+            finalScore = Math.max(0, Math.min(1, heuristic.score * 0.6 + llm.score * 0.4))
+            explanation = llm.explanation
+          }
+        }
+        const boosted = applyProfileAndWeatherBoost(finalScore, anchor, cand, body.profile, body.weather)
+        scored.push({
+          item_id: String(cand.id),
+          score: Number(boosted.toFixed(4)),
+          explanation,
+          llm_score: llmScore == null ? null : Number(llmScore.toFixed(4)),
+        })
+      } catch {
+        // skip bad candidate
+      }
+    }
+    scored.sort((a, b) => b.score - a.score)
+    const suggestions = scored.slice(0, body.topK ?? 6)
+    const source = suggestions.some((s) => s.llm_score != null) ? 'ollama+heuristic' : 'heuristic-only'
+    return res.json({
+      summary: suggestions.length
+        ? 'Recommended next items are ranked for profile, aesthetic intent, and weather context.'
+        : 'No strong next-item match found yet; add more wardrobe items for richer suggestions.',
+      suggestions: suggestions.map(({ item_id, score, explanation }) => ({ item_id, score, explanation })),
+      metadata: {
+        provider: 'vestir-server',
+        model: source === 'ollama+heuristic' ? `blend(${ollamaModel})` : 'heuristic',
+        source,
+        latency_ms: Date.now() - started,
+        version: '1.0.0',
+      },
+    })
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'suggest-next failed' })
   }
 })
 
