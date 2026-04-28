@@ -7,6 +7,7 @@ import { useWardrobeStore } from '../../store/wardrobeStore'
 import type { BlurQualityPreset, DetectedGarment, NormalizedBBox, SubjectFilterMode } from '../../types/index'
 
 type SelectionTool = 'polygon' | 'rectangle' | 'tap'
+type ReviewStep = 'select' | 'refine' | 'confirm'
 
 /**
  * SAM-style overlay palette — each detected garment gets one color from this
@@ -160,6 +161,9 @@ function DetectionCard({ garment, selected, onToggle, assignment, people, onReas
         {garment.partially_visible && (
           <p className="detection-card__warn">Partly visible</p>
         )}
+        {garment.requires_manual_review && (
+          <p className="detection-card__warn">Needs refine</p>
+        )}
       </button>
       {hasPeople && assignment ? (
         <div className={`detection-card__assignment ${assignmentTone}`}>
@@ -244,7 +248,8 @@ export function DetectionReviewSheet() {
     x2: number
     y2: number
   } | null>(null)
-  const [selectionTool, setSelectionTool] = useState<SelectionTool>('polygon')
+  const [selectionTool, setSelectionTool] = useState<SelectionTool>('tap')
+  const [reviewStep, setReviewStep] = useState<ReviewStep>('select')
   const [lastSamHintBbox, setLastSamHintBbox] = useState<NormalizedBBox | null>(null)
   /**
    * Per-garment SAM polygons, captured when the user runs "Remove backgrounds".
@@ -255,6 +260,7 @@ export function DetectionReviewSheet() {
   const [maskOverlays, setMaskOverlays] = useState<Record<string, Array<{ x: number; y: number }>>>({})
   /** Lets the user hide overlays if they clutter the canvas. Default on. */
   const [showGarmentOverlays, setShowGarmentOverlays] = useState(true)
+  const [showAdvancedActions, setShowAdvancedActions] = useState(false)
   /**
    * Tracks long-running async work so the UI can show a blocking overlay
    * (spinner + elapsed timer) instead of the user clicking the scrim in
@@ -293,8 +299,6 @@ export function DetectionReviewSheet() {
     return () => window.clearInterval(timer)
   }, [busyTask])
 
-  if (!pendingDetection) return null
-
   const {
     detected,
     scene_track,
@@ -304,7 +308,18 @@ export function DetectionReviewSheet() {
     source_image_url,
     auto_blurred_image_url,
     source_image_stage,
-  } = pendingDetection
+    scenario_route,
+  } = pendingDetection ?? {
+    detected: [],
+    scene_track: 'ambiguous' as const,
+    person_candidates: [],
+    person_assignments: [],
+    face_candidates: [],
+    source_image_url: '',
+    auto_blurred_image_url: '',
+    source_image_stage: 'original' as const,
+    scenario_route: 'ambiguous' as const,
+  }
   const personLookup = new Map(person_candidates.map((p, idx) => [p.id, { ...p, label: `Person ${String.fromCharCode(65 + idx)}` }]))
   const peopleForUi = [...personLookup.values()].map((p) => ({ id: p.id, label: p.label }))
   const assignmentMap = new Map(person_assignments.map((a) => [a.garment_id, a]))
@@ -324,7 +339,7 @@ export function DetectionReviewSheet() {
       isOverride,
     }
   }
-  const latestWarning = pendingDetection.warnings?.[pendingDetection.warnings.length - 1]
+  const latestWarning = pendingDetection?.warnings?.[pendingDetection.warnings.length - 1]
   const selectedCount = pendingDetectionSelections.size
   const allSelected = detected.every((g) => pendingDetectionSelections.has(g.id))
   const allPeopleSelected = person_candidates.length > 0
@@ -1016,6 +1031,9 @@ export function DetectionReviewSheet() {
     }
   }
 
+  const canMoveToRefine = detected.length > 0
+  const canMoveToConfirm = selectedCount > 0
+
   return (
     <div className="sheet-scrim" onClick={handleScrimPointerDown}>
       <div
@@ -1033,6 +1051,9 @@ export function DetectionReviewSheet() {
               {scene_track === 'worn' ? 'Outfit photo' : scene_track === 'flat_lay' ? 'Flat lay' : 'Photo'} · tap the ones that look right
             </p>
             <p style={{ margin: '2px 0 0', fontSize: '12px', opacity: 0.6 }}>
+              Route: {(scenario_route ?? 'ambiguous').replace('_', ' ')}
+            </p>
+            <p style={{ margin: '2px 0 0', fontSize: '12px', opacity: 0.6 }}>
               Faces detected: {face_candidates.length}
             </p>
             <p style={{ margin: '6px 0 0', fontSize: '11px', opacity: 0.55, maxWidth: 420 }}>
@@ -1044,8 +1065,42 @@ export function DetectionReviewSheet() {
                 Showing try-off product shot (garment on white).
               </p>
             )}
+            {(pendingDetection?.warnings ?? []).slice(-2).map((warningText) => (
+              <p key={warningText} style={{ margin: '6px 0 0', fontSize: '11px', color: 'var(--cocoa)' }}>
+                {warningText}
+              </p>
+            ))}
           </div>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <div className="detection-sheet__steps" role="tablist" aria-label="Review steps">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={reviewStep === 'select'}
+              className={`detection-sheet__step${reviewStep === 'select' ? ' is-active' : ''}`}
+              onClick={() => setReviewStep('select')}
+            >
+              1. Select
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={reviewStep === 'refine'}
+              className={`detection-sheet__step${reviewStep === 'refine' ? ' is-active' : ''}`}
+              onClick={() => setReviewStep('refine')}
+              disabled={!canMoveToRefine}
+            >
+              2. Refine
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={reviewStep === 'confirm'}
+              className={`detection-sheet__step${reviewStep === 'confirm' ? ' is-active' : ''}`}
+              onClick={() => setReviewStep('confirm')}
+              disabled={!canMoveToConfirm}
+            >
+              3. Confirm
+            </button>
             <button
               type="button"
               className="detection-sheet__toggle-all"
@@ -1053,29 +1108,10 @@ export function DetectionReviewSheet() {
             >
               {allSelected ? 'Clear selection' : 'Select all'}
             </button>
-            <button
-              type="button"
-              className="btn secondary"
-              onClick={handleRefineBackgrounds}
-              disabled={isBusy || detected.length === 0}
-              title="Run SAM on each selected garment to produce clean alpha PNGs (no background). ~2–5 s per item."
-              style={{ fontSize: 12, padding: '6px 10px' }}
-            >
-              Remove backgrounds
-            </button>
-            <button
-              type="button"
-              className="btn secondary"
-              onClick={() => setShowGarmentOverlays((v) => !v)}
-              disabled={detected.length === 0}
-              title="Toggle the colored mask overlays on the photo above. Each garment gets its own color so you can tell them apart."
-              style={{ fontSize: 12, padding: '6px 10px' }}
-            >
-              {showGarmentOverlays ? 'Hide masks' : 'Show masks'}
-            </button>
           </div>
         </div>
 
+        {reviewStep !== 'select' && (
         <div className="subject-filter">
           <h4 className="subject-filter__title">Subject filtering</h4>
           <p className="subject-filter__hint">Choose who stays, or keep clothing regions only.</p>
@@ -1352,6 +1388,24 @@ export function DetectionReviewSheet() {
               </svg>
             </div>
             <div className="subject-filter__actions">
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={handleRefineBackgrounds}
+                disabled={isBusy || detected.length === 0}
+                title="Run SAM on each selected garment to produce clean alpha PNGs (no background). ~2–5 s per item."
+              >
+                Remove backgrounds
+              </button>
+              <button
+                type="button"
+                className="btn secondary"
+                onClick={() => setShowGarmentOverlays((v) => !v)}
+                disabled={detected.length === 0}
+                title="Toggle colored mask overlays on the photo above."
+              >
+                {showGarmentOverlays ? 'Hide masks' : 'Show masks'}
+              </button>
               <button type="button" className="detection-sheet__toggle-all" onClick={undoPoint}>
                 Undo point
               </button>
@@ -1402,11 +1456,21 @@ export function DetectionReviewSheet() {
               <button
                 type="button"
                 className="btn secondary"
-                onClick={handleSamRefineMask}
+                onClick={() => setShowAdvancedActions((v) => !v)}
                 disabled={isBusy}
               >
-                Refine mask (SAM)
+                {showAdvancedActions ? 'Hide refine tools' : 'Refine more'}
               </button>
+              {showAdvancedActions && (
+                <>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={handleSamRefineMask}
+                    disabled={isBusy}
+                  >
+                    Refine mask (SAM)
+                  </button>
               <button
                 type="button"
                 className="btn secondary"
@@ -1427,6 +1491,8 @@ export function DetectionReviewSheet() {
                     ? 'Working…'
                     : 'Generate mannequin (white bg)'}
               </button>
+                </>
+              )}
             </div>
             <div
               className="subject-filter__mode-row"
@@ -1460,8 +1526,8 @@ export function DetectionReviewSheet() {
                       border: '1px solid var(--border)',
                       borderRadius: 8,
                       padding: '7px 9px',
-                      background: 'var(--panel)',
-                      color: 'var(--text)',
+                      background: 'var(--card)',
+                      color: 'var(--foreground)',
                     }}
                   />
                 </label>
@@ -1470,6 +1536,7 @@ export function DetectionReviewSheet() {
             {/* Try-off temporarily disabled to evaluate SAM-based mannequin extraction quality. */}
           </div>
         </div>
+        )}
 
         <div className="detection-grid">
           {detected.map((garment, idx) => (
@@ -1489,6 +1556,28 @@ export function DetectionReviewSheet() {
         </div>
 
         <div className="detection-sheet__actions">
+          {reviewStep === 'select' && (
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={!canMoveToRefine || isBusy}
+              onClick={() => setReviewStep('refine')}
+              style={{ flex: 1 }}
+            >
+              Continue to Refine
+            </button>
+          )}
+          {reviewStep === 'refine' && (
+            <button
+              type="button"
+              className="btn secondary"
+              disabled={!canMoveToConfirm || isBusy}
+              onClick={() => setReviewStep('confirm')}
+              style={{ flex: 1 }}
+            >
+              Continue to Confirm
+            </button>
+          )}
           <button
             type="button"
             className="btn"

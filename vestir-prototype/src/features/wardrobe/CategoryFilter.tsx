@@ -1,19 +1,27 @@
 import type { Category } from '../../types/index'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 
-const categories: Array<Category | 'All'> = ['All', 'Tops', 'Bottoms', 'Outerwear', 'Shoes', 'Accessories']
+const CATEGORIES: Array<{ value: Category | 'All'; label: string }> = [
+  { value: 'All', label: 'All' },
+  { value: 'Tops', label: 'Tops' },
+  { value: 'Bottoms', label: 'Bottoms' },
+  { value: 'Outerwear', label: 'Outerwear' },
+  { value: 'Shoes', label: 'Shoes' },
+  { value: 'Accessories', label: 'Accessories' },
+]
 
 export function CategoryFilter() {
   const { activeCategory, setActiveCategory } = useWardrobeStore()
   return (
     <div className="category-row">
-      {categories.map((category) => (
+      {CATEGORIES.map(({ value, label }) => (
         <button
-          key={category}
-          className={`category-btn ${activeCategory === category ? 'category-active' : ''}`}
-          onClick={() => setActiveCategory(category)}
+          key={value}
+          type="button"
+          className={`category-btn${activeCategory === value ? ' category-active' : ''}`}
+          onClick={() => setActiveCategory(value)}
         >
-          {category}
+          {label}
         </button>
       ))}
     </div>
