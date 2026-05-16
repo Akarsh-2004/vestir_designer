@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { ChevronLeft } from 'lucide-react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { evaluateCandidate, type CandidateReasons } from '../../lib/finishMyFitEngine'
 import { useWardrobeStore } from '../../store/wardrobeStore'
@@ -35,15 +36,19 @@ export function FinishMyFitScreen() {
   const seeded = Array.isArray((location.state as { preselectedIds?: string[] } | null)?.preselectedIds)
     ? ((location.state as { preselectedIds?: string[] }).preselectedIds ?? [])
     : []
-  const [selectedIds, setSelectedIds] = useState<string[]>(seeded)
-  const [lockedByLayer, setLockedByLayer] = useState<Partial<Record<Category, string>>>({})
+  const [selectedByLayer, setSelectedByLayer] = useState<Partial<Record<Category, string>>>(() => {
+    const initial: Partial<Record<Category, string>> = {}
+    for (const id of seeded) {
+      const match = items.find((it) => it.id === id && !it.deleted_at)
+      if (match) initial[match.category] = match.id
+    }
+    return initial
+  })
   const [weatherFilter, setWeatherFilter] = useState<'all' | 'warm' | 'cold'>('all')
 
   const anchor = items.find((i) => i.id === anchorId && !i.deleted_at)
-  const selectedItems = useMemo(
-    () => items.filter((i) => selectedIds.includes(i.id)),
-    [items, selectedIds],
-  )
+  const selectedIds = useMemo(() => Object.values(selectedByLayer).filter(Boolean) as string[], [selectedByLayer])
+  const selectedItems = useMemo(() => items.filter((i) => selectedIds.includes(i.id)), [items, selectedIds])
   const selectedPlusAnchor = useMemo(
     () => (anchor ? [anchor, ...selectedItems] : []),
     [anchor, selectedItems],
@@ -81,11 +86,23 @@ export function FinishMyFitScreen() {
   if (!anchor) return <div className="card">Anchor item not found.</div>
 
   return (
-    <section>
-      <div className="card">
-        <strong>Create My Fit Controls</strong>
-        <div className="actions" style={{ marginTop: 10, flexWrap: 'wrap', gap: 8 }}>
-          <select className="subject-filter__select" value={weatherFilter} onChange={(e) => setWeatherFilter(e.target.value as 'all' | 'warm' | 'cold')}>
+    <section className="screen">
+      <header className="screen-header">
+        <button className="back-btn" type="button" onClick={() => navigate(-1)} aria-label="Back">
+          <ChevronLeft size={20} />
+        </button>
+        <div className="screen-header-center">
+          <span className="screen-title">Finish My Fit</span>
+          <span className="screen-subtitle">Build around your anchor piece</span>
+        </div>
+        <div style={{ width: 36, height: 36 }} />
+      </header>
+
+      <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div className="card fmf-controls-card">
+          <strong>Create My Fit</strong>
+          <div className="actions" style={{ marginTop: 10, flexWrap: 'wrap', gap: 8 }}>
+            <select className="subject-filter__select" value={weatherFilter} onChange={(e) => setWeatherFilter(e.target.value as 'all' | 'warm' | 'cold')}>
             <option value="all">Any weather</option>
             <option value="warm">Warm</option>
             <option value="cold">Cold</option>
@@ -99,8 +116,7 @@ export function FinishMyFitScreen() {
             onChange={(e) => {
               const nextId = e.target.value
               if (nextId && nextId !== anchor.id) {
-                setSelectedIds([])
-                setLockedByLayer({})
+                setSelectedByLayer({})
                 navigate(`/finish-my-fit/${nextId}`, { replace: true })
               }
             }}
@@ -118,85 +134,90 @@ export function FinishMyFitScreen() {
           <span className="subject-filter__hint" style={{ margin: 0 }}>
             Outfit health: {clashCount === 0 ? 'Clean fit' : `${clashCount} clashes`}
           </span>
-          <span className="subject-filter__hint" style={{ margin: 0, opacity: 0.65 }}>
-            {items.filter((i) => !i.deleted_at && i.ai_processed).length} items in wardrobe · {candidates.length} candidates shown
-          </span>
+            <span className="subject-filter__hint" style={{ margin: 0, opacity: 0.65 }}>
+              {items.filter((i) => !i.deleted_at && i.ai_processed).length} items in wardrobe · {candidates.length} candidates shown
+            </span>
+          </div>
         </div>
-      </div>
-      <div className="card anchor-card">
-        <ItemPhoto itemId={anchor.id} imageUrl={anchor.image_url} alt={anchor.item_type} size="md" />
-        <div>
-          <strong>{anchor.item_type}</strong>
-          <p className="muted">
-            {anchor.color_primary} · {anchor.material}
-          </p>
-        </div>
-      </div>
 
-      {layerOrder
+        <div className="card anchor-card">
+          <ItemPhoto itemId={anchor.id} imageUrl={anchor.image_url} alt={anchor.item_type} size="md" />
+          <div>
+            <strong>{anchor.item_type}</strong>
+            <p className="muted">
+              {anchor.color_primary} · {anchor.material}
+            </p>
+          </div>
+        </div>
+
+        <div className="card fmf-preview-card">
+          <strong>Live look</strong>
+          <div className="fmf-preview-row">
+            {[anchor, ...selectedItems].map((it) => (
+              <div key={it.id} className="fmf-preview-piece">
+                <ItemPhoto itemId={it.id} imageUrl={it.image_url} alt={it.item_type} size="sm" />
+                <small>{it.category}</small>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {layerOrder
         .filter((layer) => layer !== anchor.category)
         .map((layer) => {
           const layerItems = candidates.filter((c) => c.item.category === layer)
           if (!layerItems.length) return null
+          const selectedIdForLayer = selectedByLayer[layer]
           return (
             <div key={layer} className="layer-block">
               <h3>{layer}</h3>
               <div className="carousel">
                 {layerItems.map(({ item, evalResult }) => {
-                  const selected = selectedIds.includes(item.id) || lockedByLayer[layer] === item.id
-                  const locked = lockedByLayer[layer] === item.id
+                  const selected = selectedIdForLayer === item.id
+                  const tone = evalResult.isClash ? 'clash' : evalResult.level
                   return (
                     <button
                       key={item.id}
-                      className={`fit-card ${selected ? 'fit-selected' : ''}`}
-                      style={{
-                        opacity: evalResult.isClash ? 0.3 : evalResult.level === 'fair' ? 0.65 : 1,
-                        transform: evalResult.isClash ? 'scale(0.88)' : undefined,
-                        borderColor: evalResult.isClash ? '#d24d57' : '#4aa66a',
-                        filter: evalResult.isClash ? 'saturate(0.15) blur(0.7px)' : undefined,
+                      className={`fit-card fit-card--${tone}${selected ? ' fit-selected' : ''}`}
+                      onClick={() => {
+                        setSelectedByLayer((state) => ({
+                          ...state,
+                          [layer]: state[layer] === item.id ? undefined : item.id,
+                        }))
+                        vibrate(evalResult.hapticType)
                       }}
-                      onClick={() =>
-                        setSelectedIds((state) => {
-                          const base = state.includes(item.id) ? state.filter((id) => id !== item.id) : [...state, item.id]
-                          vibrate(evalResult.hapticType)
-                          return base
-                        })
-                      }
                     >
-                      <ItemPhoto itemId={item.id} imageUrl={item.image_url} alt={item.item_type} size="full" />
-                      <small>{item.item_type}</small>
-                      <small style={{ textTransform: 'capitalize' }}>{evalResult.isClash ? 'Clash' : evalResult.level}</small>
-                      <small>{item.color_primary} · {item.material}</small>
-                      <small>{(item.occasions ?? []).slice(0, 2).join(', ') || 'versatile'}</small>
-                      <div className="fmf-reasons" onClick={(e) => e.stopPropagation()}>
-                        {(['color', 'formality', 'season'] as const).map((dim) => {
-                          const label = reasonLabel(dim, evalResult.reasons[dim])
-                          return (
-                            <span key={dim} className={`fmf-reason fmf-reason--${label.tone}`}>
-                              {label.label}
-                            </span>
-                          )
-                        })}
+                      <div className="fit-card__photo">
+                        <ItemPhoto itemId={item.id} imageUrl={item.image_url} alt={item.item_type} size="full" />
                       </div>
-                      {evalResult.isClash && evalResult.worstPairWith ? (
-                        <small style={{ color: '#d24d57' }}>
-                          Tension with {evalResult.worstPairWith}
+                      <div className="fit-card__meta">
+                        <strong className="fit-card__type">{item.item_type}</strong>
+                        <span className={`fit-card__tone fit-card__tone--${tone}`}>
+                          {evalResult.isClash ? 'Clash' : evalResult.level}
+                        </span>
+                        <small className="fit-card__sub">{item.color_primary} · {item.material}</small>
+                        <small className="fit-card__sub fit-card__sub--muted">
+                          {(item.occasions ?? []).slice(0, 2).join(', ') || 'versatile'}
                         </small>
-                      ) : null}
-                      <span
-                        className="subject-filter__hint"
-                        style={{ marginTop: 4, color: locked ? '#d24d57' : 'inherit' }}
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          setLockedByLayer((state) => ({
-                            ...state,
-                            [layer]: state[layer] === item.id ? undefined : item.id,
-                          }))
-                        }}
-                      >
-                        {locked ? 'Unlock this layer' : 'Lock this layer'}
-                      </span>
+                        <div className="fmf-reasons" onClick={(e) => e.stopPropagation()}>
+                          {(['color', 'formality', 'season'] as const).map((dim) => {
+                            const label = reasonLabel(dim, evalResult.reasons[dim])
+                            return (
+                              <span key={dim} className={`fmf-reason fmf-reason--${label.tone}`}>
+                                {label.label}
+                              </span>
+                            )
+                          })}
+                        </div>
+                        {evalResult.isClash && evalResult.worstPairWith ? (
+                          <small className="fit-card__tension">
+                            Tension with {evalResult.worstPairWith}
+                          </small>
+                        ) : null}
+                        <span className="fit-card__cta">
+                          {selected ? 'Selected for this layer' : 'Tap to select'}
+                        </span>
+                      </div>
                     </button>
                   )
                 })}
@@ -204,6 +225,7 @@ export function FinishMyFitScreen() {
             </div>
           )
         })}
+      </div>
 
       {selectedIds.length >= 1 ? (
         <div className="sticky-save">
@@ -212,17 +234,13 @@ export function FinishMyFitScreen() {
             className="btn"
             onClick={() => {
               const selectedItems: Item[] = items.filter((i) => selectedIds.includes(i.id))
-              const lockedItems: Item[] = items.filter((i) => Object.values(lockedByLayer).includes(i.id))
-              const dedup = [...selectedItems, ...lockedItems].filter(
-                (item, index, arr) => arr.findIndex((v) => v.id === item.id) === index,
-              )
               addOutfit({
                 id: crypto.randomUUID(),
                 user_id: anchor.user_id,
                 wardrobe_id: anchor.wardrobe_id,
                 name: `${anchor.color_primary} ${anchor.item_type}`,
                 anchor_item_id: anchor.id,
-                items: [anchor, ...dedup],
+                items: [anchor, ...selectedItems],
                 created_at: new Date().toISOString(),
               })
               navigate('/')

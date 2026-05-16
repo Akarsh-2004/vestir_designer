@@ -8,10 +8,10 @@ interface EmptyStateProps {
 
 export function EmptyState({ title, description, action }: EmptyStateProps) {
   return (
-    <div className="card empty">
+    <div className="empty-state" role="status" aria-live="polite">
       <h3>{title}</h3>
-      {description ? <p className="muted">{description}</p> : null}
-      {action ? <div className="empty-action">{action}</div> : null}
+      {description ? <p>{description}</p> : null}
+      {action ?? null}
     </div>
   )
 }

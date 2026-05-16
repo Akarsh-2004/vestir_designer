@@ -63,12 +63,17 @@ export function WardrobeScreen() {
       </header>
 
       {searchOpen && (
-        <div className="wardrobe-search-bar">
+        <div className="wardrobe-search-bar" role="search" aria-label="Search wardrobe items">
           <input
             className="search-input"
             placeholder="Search items, colours, materials…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
+            autoComplete="off"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="search"
             autoFocus
           />
         </div>

@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { Camera, Image, Loader } from 'lucide-react'
 import { toast } from 'sonner'
+import { useBodyScrollLock } from '../../hooks/useBodyScrollLock'
 import { useWardrobeStore } from '../../store/wardrobeStore'
 
 interface AddItemsSheetProps {
@@ -11,6 +12,16 @@ interface AddItemsSheetProps {
 export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
   const { detectItemsFromFile, addPendingItemsFromFiles, runHybridAiPipeline } = useWardrobeStore()
   const [detecting, setDetecting] = useState(false)
+  const titleId = useId()
+  useBodyScrollLock(open)
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
   if (!open) return null
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -50,26 +61,44 @@ export function AddItemsSheet({ open, onClose }: AddItemsSheetProps) {
   }
 
   return (
-    <div className="sheet-scrim" onClick={onClose}>
-      <div className="sheet" onClick={(e) => e.stopPropagation()}>
-        <div className="sheet-handle" />
-        <h3>Add Items</h3>
-        <button className="sheet-option" type="button" disabled>
+    <div className="sheet-scrim" onClick={onClose} role="presentation">
+      <div
+        className="sheet"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+      >
+        <div className="sheet-handle" aria-hidden />
+        <h3 className="sheet-title" id={titleId}>
+          Add items
+        </h3>
+        <p className="muted sheet-subtitle">
+          One photo to detect every garment, or batch import a whole album.
+        </p>
+        <label className="sheet-option" style={{ opacity: detecting ? 0.6 : 1, pointerEvents: detecting ? 'none' : undefined }}>
           <span className="sheet-icon">
             <Camera size={20} />
           </span>
           <span>
-            <strong>Camera</strong>
-            <small>Coming soon</small>
+            <strong>Take photo</strong>
+            <small>Snap a garment with your camera</small>
           </span>
-        </button>
+          <input
+            hidden
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={handleFileChange}
+          />
+        </label>
         <label className="sheet-option" style={{ opacity: detecting ? 0.6 : 1, pointerEvents: detecting ? 'none' : undefined }}>
           <span className="sheet-icon">
             {detecting ? <Loader size={20} className="spin" /> : <Image size={20} />}
           </span>
           <span>
-            <strong>Photo Library</strong>
-            <small>{detecting ? 'Detecting items…' : 'Single photo detects all garments in one shot'}</small>
+            <strong>Photo library</strong>
+            <small>{detecting ? 'Detecting items…' : 'Single photo detects every garment'}</small>
           </span>
           <input
             hidden

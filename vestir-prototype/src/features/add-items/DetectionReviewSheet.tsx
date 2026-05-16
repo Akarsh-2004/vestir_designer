@@ -1,5 +1,6 @@
 import { CheckCircle, Circle, Star } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { useBodyScrollLock } from '../../hooks/useBodyScrollLock'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { toast } from 'sonner'
 import { refineMaskWithSam } from '../../lib/pipeline/adapters'
@@ -298,6 +299,21 @@ export function DetectionReviewSheet() {
     }, 250)
     return () => window.clearInterval(timer)
   }, [busyTask])
+
+  useBodyScrollLock(true)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (busyTask) {
+        toast.message(`${busyTask.label} Please wait — try again once it finishes.`)
+        return
+      }
+      dismissDetection()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [busyTask, dismissDetection])
 
   const {
     detected,
@@ -1035,13 +1051,16 @@ export function DetectionReviewSheet() {
   const canMoveToConfirm = selectedCount > 0
 
   return (
-    <div className="sheet-scrim" onClick={handleScrimPointerDown}>
+    <div className="sheet-scrim" onClick={handleScrimPointerDown} role="presentation">
       <div
         className="sheet detection-sheet"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Review detected items"
         style={{ paddingBottom: '24px' }}
       >
-        <div className="sheet-handle" />
+        <div className="sheet-handle" aria-hidden />
         <div className="detection-sheet__header">
           <div>
             <h3 style={{ margin: 0, fontSize: '15px' }}>

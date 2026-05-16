@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
@@ -121,6 +122,8 @@ _FACE_MODEL = None
 _FACE_MODEL_ERROR: str | None = None
 _FASHION_COLOR_ENTRIES: list | None = None
 _SAM_PREDICTOR: Any | None = None
+_SAM_BACKEND: str = "uninitialized"
+_SAM_CHECKPOINT: str | None = None
 _SAM_ERROR: str | None = None
 
 
@@ -590,15 +593,12 @@ def _decode_image(image_base64: str) -> np.ndarray | None:
 
 
 def _load_sam_predictor():
-    global _SAM_PREDICTOR, _SAM_ERROR
+    global _SAM_PREDICTOR, _SAM_ERROR, _SAM_BACKEND, _SAM_CHECKPOINT
     if _SAM_PREDICTOR is not None:
         return _SAM_PREDICTOR
     if _SAM_ERROR is not None:
         raise RuntimeError(_SAM_ERROR)
     try:
-        from segment_anything import SamPredictor, sam_model_registry  # type: ignore
-
-        model_type = (os.environ.get("SAM_MODEL_TYPE", "").strip() or "vit_b").lower()
         checkpoint = os.environ.get("SAM_CHECKPOINT", "").strip()
         if not checkpoint:
             default_checkpoint = os.path.join(os.path.dirname(__file__), "weights", "sam_vit_b_01ec64.pth")
@@ -606,9 +606,25 @@ def _load_sam_predictor():
                 checkpoint = default_checkpoint
         if not checkpoint:
             raise RuntimeError("SAM_CHECKPOINT not configured")
+        _SAM_CHECKPOINT = checkpoint
+        use_ultralytics_sam2 = (
+            str(os.environ.get("SAM_USE_ULTRALYTICS_SAM2", "")).strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if use_ultralytics_sam2 and "sam2" in os.path.basename(checkpoint).lower():
+            from ultralytics import SAM  # type: ignore
+
+            model = SAM(checkpoint)
+            _SAM_PREDICTOR = model
+            _SAM_BACKEND = "sam2_ultralytics"
+            return _SAM_PREDICTOR
+
+        from segment_anything import SamPredictor, sam_model_registry  # type: ignore
+
+        model_type = (os.environ.get("SAM_MODEL_TYPE", "").strip() or "vit_b").lower()
         sam = sam_model_registry[model_type](checkpoint=checkpoint)
         sam.to(device="cuda" if torch.cuda.is_available() else "cpu")
         _SAM_PREDICTOR = SamPredictor(sam)
+        _SAM_BACKEND = "sam1_segment_anything"
         return _SAM_PREDICTOR
     except Exception as exc:  # noqa: BLE001
         _SAM_ERROR = f"sam_unavailable: {exc}"
@@ -628,6 +644,47 @@ def _largest_polygon_from_mask(mask: np.ndarray, width: int, height: int) -> lis
         y = float(np.clip(p[1] / max(1, height), 0.0, 1.0))
         out.append({"x": round(x, 4), "y": round(y, 4)})
     return out
+
+
+def _predict_sam_masks(
+    predictor: Any,
+    image: np.ndarray,
+    input_box: np.ndarray,
+    balanced: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if _SAM_BACKEND == "sam2_ultralytics":
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        result = predictor.predict(
+            source=rgb,
+            bboxes=[input_box.tolist()],
+            retina_masks=True,
+            verbose=False,
+        )
+        if not result:
+            raise RuntimeError("sam2_ultralytics returned no results")
+        masks_data = getattr(getattr(result[0], "masks", None), "data", None)
+        if masks_data is None:
+            raise RuntimeError("sam2_ultralytics returned no masks")
+        masks_np = np.asarray(masks_data.detach().cpu().numpy())
+        if masks_np.ndim == 2:
+            masks_np = masks_np[np.newaxis, ...]
+        conf = getattr(getattr(result[0], "boxes", None), "conf", None)
+        if conf is not None:
+            scores_np = np.asarray(conf.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        else:
+            scores_np = np.ones((masks_np.shape[0],), dtype=np.float64)
+        if scores_np.size == 0:
+            scores_np = np.ones((masks_np.shape[0],), dtype=np.float64)
+        return masks_np, scores_np
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    predictor.set_image(rgb)
+    masks, scores, _ = predictor.predict(box=input_box, multimask_output=bool(balanced))
+    masks_np = np.asarray(masks)
+    if masks_np.ndim == 2:
+        masks_np = masks_np[np.newaxis, ...]
+    scores_np = np.atleast_1d(np.asarray(scores, dtype=np.float64))
+    return masks_np, scores_np
 
 
 def _grabcut_mask_from_bbox(image: np.ndarray, bbox: dict[str, float]) -> np.ndarray:
@@ -734,6 +791,8 @@ def health() -> dict[str, Any]:
         "hybrid_infer_error": model_error,
         "face_model_id": os.environ.get("HF_FACE_MODEL_ID", "").strip() or "arnabdhar/YOLOv8-Face-Detection",
         "sam_available": _SAM_PREDICTOR is not None and _SAM_ERROR is None,
+        "sam_backend": _SAM_BACKEND,
+        "sam_checkpoint": _SAM_CHECKPOINT,
         "sam_error": _SAM_ERROR,
     }
 
@@ -908,6 +967,7 @@ def detect_faces(payload: FaceDetectRequest) -> dict[str, Any]:
 
 @app.post("/sam/segment")
 def sam_segment(payload: SamSegmentRequest) -> dict[str, Any]:
+    started = time.perf_counter()
     image = _decode_image(payload.image_base64)
     if image is None:
         return {"ok": False, "error": "decode_failed", "segments": []}
@@ -916,22 +976,17 @@ def sam_segment(payload: SamSegmentRequest) -> dict[str, Any]:
         return {"ok": False, "error": "invalid_image", "segments": []}
     segments: list[dict[str, Any]] = []
     backend = "grabcut_fallback"
+    fallback_count = 0
+    fallback_reason = None
     try:
         predictor = _load_sam_predictor()
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        predictor.set_image(rgb)
         for idx, bbox in enumerate(payload.boxes):
             x1 = float(max(0, min(1, bbox.get("x1", 0.0))) * w)
             y1 = float(max(0, min(1, bbox.get("y1", 0.0))) * h)
             x2 = float(max(0, min(1, bbox.get("x2", 1.0))) * w)
             y2 = float(max(0, min(1, bbox.get("y2", 1.0))) * h)
             input_box = np.array([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)])
-            multimask = bool(payload.balanced)
-            masks, scores, _ = predictor.predict(box=input_box, multimask_output=multimask)
-            scores_np = np.atleast_1d(np.asarray(scores, dtype=np.float64))
-            masks_np = np.asarray(masks)
-            if masks_np.ndim == 2:
-                masks_np = masks_np[np.newaxis, ...]
+            masks_np, scores_np = _predict_sam_masks(predictor, image, input_box, bool(payload.balanced))
             prompt_xyxy = (
                 int(max(0, min(w - 1, input_box[0]))),
                 int(max(0, min(h - 1, input_box[1]))),
@@ -953,29 +1008,46 @@ def sam_segment(payload: SamSegmentRequest) -> dict[str, Any]:
             mask = (masks_np[best_idx].astype(np.uint8) * 255)
             polygon = _largest_polygon_from_mask(mask, w, h)
             seg_score = float(scores_np.flat[min(best_idx, max(0, scores_np.size - 1))])
+            area_ratio = float((mask > 0).sum()) / float(max(1, w * h))
             segments.append(
                 {
                     "id": f"seg-{idx+1}",
                     "score": seg_score,
                     "bbox": bbox,
                     "polygon": polygon,
+                    "area_ratio": round(area_ratio, 4),
                 }
             )
-        backend = "sam2"
-    except Exception:
+        backend = _SAM_BACKEND
+    except Exception as exc:
+        fallback_reason = str(exc)
         for idx, bbox in enumerate(payload.boxes):
+            mask = None
             try:
                 mask = _grabcut_mask_from_bbox(image, bbox)
                 polygon = _largest_polygon_from_mask(mask, w, h)
             except Exception:
                 polygon = []
+            fallback_count += 1
             segments.append(
                 {
                     "id": f"seg-{idx+1}",
                     "score": 0.45,
                     "bbox": bbox,
                     "polygon": polygon,
+                    "area_ratio": round(float((mask > 0).sum()) / float(max(1, w * h)), 4) if mask is not None else 0.0,
                 }
             )
-    return {"ok": True, "backend": backend, "segments": segments}
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "ok": True,
+        "backend": backend,
+        "segments": segments,
+        "metrics": {
+            "latency_ms": elapsed_ms,
+            "segments_count": len(segments),
+            "fallback_count": fallback_count,
+            "fallback_reason": fallback_reason,
+        },
+    }
 

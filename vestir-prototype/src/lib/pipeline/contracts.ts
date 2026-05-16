@@ -72,7 +72,7 @@ export interface InferenceResult {
     blocks_embedding?: boolean
     arbitration_applied?: boolean
   }
-  source_image_stage?: 'tryoff' | 'blurred_fallback'
+  source_image_stage?: 'original' | 'tryoff' | 'blurred_fallback' | 'mannequin' | 'preprocess'
   gemini_style_notes?: string
   gemini_design_tags?: string[]
   /** Layered SigLIP vocabulary tags (vision-sidecar v3+). */

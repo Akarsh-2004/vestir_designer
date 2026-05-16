@@ -22,3 +22,29 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local caches
+.hf-cache/
+.vite-cache/
+
+# Python virtual environments
+.venv/
+**/.venv/
+**/.venv311/
+
+# Python cache / artifacts
+__pycache__/
+*.pyc
+
+# Local temp data
+tmp_pipeline_tests/
+
+# Large local/model artifacts
+tryon-sidecar/models/
+vision-sidecar/runs/
+server/storage/

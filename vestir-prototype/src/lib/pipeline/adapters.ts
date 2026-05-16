@@ -11,6 +11,7 @@ import type {
 } from './contracts'
 import type { BlurQualityPreset, DetectionResult, FitLabel, Item, NormalizedBBox, NormalizedPoint, SubjectFilterConfig } from '../../types/index'
 import { FIT_LABELS } from '../../types/index'
+import { inferCategoryFromText } from '../categoryInference'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
@@ -273,14 +274,20 @@ function normalizeItemType(raw: InferenceResult): string {
   return toTitleCase(source.replace(/[_-]+/g, ' '))
 }
 
-function inferCategoryFromItemType(itemType: string): Item['category'] | null {
-  const key = itemType.trim().toLowerCase()
-  if (!key) return null
-  if (/(trouser|trousers|pants|jeans|shorts|skirt|capri|pyjama)/.test(key)) return 'Bottoms'
-  if (/(jacket|coat|blazer|outerwear)/.test(key)) return 'Outerwear'
-  if (/(shoe|shoes|sneaker|boot|loafer|heel|sandal|footwear)/.test(key)) return 'Shoes'
-  if (/(belt|bag|cap|hat|watch|jewelry|accessory|accessories|scarf)/.test(key)) return 'Accessories'
-  if (/(shirt|tshirt|t-shirt|top|dress|frock|hoodie|sweater|sweatshirt|vest)/.test(key)) return 'Tops'
+// Single source of truth for text-driven category inference. See ../categoryInference.ts.
+function inferCategoryFromRaw(raw: InferenceResult, normalizedItemType: string): Item['category'] | null {
+  const probes = [
+    normalizedItemType,
+    raw.item_type,
+    raw.subtype,
+    raw.category,
+    ...(raw.fashion_tags ?? []),
+    raw.fashion_descriptor,
+  ]
+  for (const probe of probes) {
+    const hit = inferCategoryFromText(probe)
+    if (hit) return hit
+  }
   return null
 }
 
@@ -352,7 +359,7 @@ export const normalizeAttributesAdapter = async (raw: InferenceResult): Promise<
   const normalizedSeason = normalizeSeason(raw.season)
   const normalizedFormality = Math.max(1, Math.min(10, raw.formality || 5))
   const normalizedItemType = normalizeItemType(raw)
-  const inferredCategory = inferCategoryFromItemType(normalizedItemType)
+  const inferredCategory = inferCategoryFromRaw(raw, normalizedItemType)
   const normalizedCategory = inferredCategory ?? normalizeCategory(raw.category)
   const normalizedFit = normalizeFit(raw.fit)
   const normalizedMaterial = normalizeMaterial(raw.material)

@@ -1,12 +1,162 @@
-
+# =========================
+# OS / Editor
+# =========================
 .DS_Store
-build
-.git
-*.egg-info
-dist
-output
-data/coco
-backup
-weights/*.weights
-__pycache__
-checkpoints
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+wandb/
+mlruns/
+tensorboard/
+runs/
+
+# =========================
+# Model Weights / Checkpoints
+# =========================
+checkpoints/
+weights/
+models/
+pretrained/
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.weights
+*.tflite
+*.pb
+
+# =========================
+# Datasets / Data
+# =========================
+data/
+datasets/
+dataset/
+coco/
+images/
+annotations/
+downloads/
+backup/
+
+# CSV / parquet / data files anywhere
+**/*.csv
+**/*.tsv
+**/*.jsonl
+**/*.parquet
+**/*.feather
+**/*.h5
+**/*.hdf5
+**/*.pkl
+**/*.pickle
+**/*.joblib
+
+# =========================
+# Images / Videos anywhere
+# =========================
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.bmp
+**/*.tiff
+**/*.webp
+**/*.svg
+
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.mkv
+**/*.webm
+
+# =========================
+# Audio files
+# =========================
+**/*.mp3
+**/*.wav
+**/*.flac
+**/*.aac
+
+# =========================
+# Large archives
+# =========================
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.7z
+*.rar
+
+# =========================
+# Outputs / Predictions
+# =========================
+output/
+outputs/
+results/
+predictions/
+experiments/
+tmp/
+temp/
+cache/
+
+# =========================
+# Ollama
+# =========================
+ollama/
+.modelfiles/
+
+# =========================
+# SAM / Vision cache
+# =========================
+*.npy
+*.npz
+
+# =========================
+# Secrets / Env
+# =========================
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+credentials.json
+
+# =========================
+# Temp
+# =========================
+*.swp
+*.swo

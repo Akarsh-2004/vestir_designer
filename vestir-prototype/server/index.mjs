@@ -1,9 +1,11 @@
 import cors from 'cors'
 import express from 'express'
+import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import sharp from 'sharp'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { GoogleGenAI } from '@google/genai'
 import vision from '@google-cloud/vision'
 import { z } from 'zod'
@@ -52,11 +54,20 @@ const geminiApiKeySource = geminiConfig.source
 const faceClient = process.env.GOOGLE_APPLICATION_CREDENTIALS ? new vision.ImageAnnotatorClient() : null
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434'
 const ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.2:3b'
+/** Text embeddings; separate from Gemini 3 generative models. Change only with a full wardrobe re-embed (dims may differ). */
 const embeddingModel = process.env.GEMINI_EMBEDDING_MODEL ?? 'gemini-embedding-001'
 const visionSidecarUrl = process.env.VISION_SIDECAR_URL ?? 'http://127.0.0.1:8008'
 const embeddingSidecarUrl = (process.env.EMBEDDING_SIDECAR_URL ?? '').trim()
-const inferFlashModel = process.env.VESTIR_INFER_FLASH_MODEL ?? 'gemini-2.5-flash'
-const inferProModel = process.env.VESTIR_INFER_PRO_MODEL ?? 'gemini-2.5-pro'
+/** Gemini 3 family (preview) — overrides: VESTIR_INFER_FLASH_MODEL, VESTIR_INFER_PRO_MODEL */
+const inferFlashModel = process.env.VESTIR_INFER_FLASH_MODEL ?? 'gemini-3-flash-preview'
+const inferProModel = process.env.VESTIR_INFER_PRO_MODEL ?? 'gemini-3.1-pro-preview'
+const mannequinGeminiModel = process.env.MANNEQUIN_GEMINI_MODEL ?? 'gemini-3-pro-image-preview'
+const mannequinGeminiPrompt = process.env.MANNEQUIN_GEMINI_PROMPT
+  ?? 'Extract only the clothing from this image on a pure white background. Do not show any mannequin, body, skin, person, or inner support. Provide only cloth with clean edges.'
+const mannequinRootDir = process.env.MANNEQUIN_ROOT_DIR ?? '/Users/akarshsaklani/Desktop/mannequin'
+const mannequinScriptPath = path.join(mannequinRootDir, 'mannequin_pipeline.py')
+const mannequinVenvPythonPath = path.join(mannequinRootDir, '.venv', 'bin', 'python')
+const execFileAsync = promisify(execFile)
 const inferBackend = (process.env.VESTIR_INFER_BACKEND ?? 'hybrid_sidecar').toLowerCase()
 /** gemini_on_disagreement: second Gemini pass when vision-sidecar sets attribute_disagreement (skipped when skipArbitration). */
 const inferArbitrateMode = (process.env.VESTIR_INFER_ARBITRATE ?? '').trim().toLowerCase()
@@ -91,6 +102,7 @@ const STYLE_ENUM = ['minimalist', 'preppy', 'techwear', 'classic', 'sporty', 'st
 const LAYERING_ROLE_ENUM = ['base_layer', 'mid_layer', 'outer_layer', 'standalone']
 const SEASON_ENUM = ['spring', 'summer', 'autumn', 'winter']
 const FIT_ENUM = ['slim', 'regular', 'relaxed', 'oversized', 'unknown']
+const SOURCE_IMAGE_STAGE_ENUM = ['original', 'tryoff', 'blurred_fallback', 'mannequin', 'preprocess']
 
 const hslSchema = z.object({
   h: z.number().min(0).max(360),
@@ -186,7 +198,7 @@ const inferSchema = z.object({
     requires_user_confirmation: z.boolean(),
     uncertain_fields: z.array(z.string()),
   }),
-  source_image_stage: z.enum(['tryoff', 'blurred_fallback']).optional(),
+  source_image_stage: z.enum(SOURCE_IMAGE_STAGE_ENUM).optional(),
   gemini_style_notes: z.string().optional(),
   gemini_design_tags: z.array(z.string()).optional(),
   gemini_brand_like: z.array(z.object({
@@ -234,7 +246,7 @@ const preprocessRequestSchema = z.object({
 })
 const inferRequestSchema = z.object({
   processedImageUrl: z.string().min(1),
-  sourceImageStage: z.enum(['tryoff', 'blurred_fallback']).optional(),
+  sourceImageStage: z.enum(SOURCE_IMAGE_STAGE_ENUM).optional(),
   forceGemini: z.boolean().optional(),
   /** When true, skip Gemini disagreement arbitration (e.g. extension match latency). */
   skipArbitration: z.boolean().optional(),
@@ -313,6 +325,14 @@ const extensionMatchSchema = z.object({
   title: z.string().optional(),
   topK: z.number().int().min(1).max(20).optional(),
 })
+const extensionCaptureSchema = z.object({
+  imageUrl: z.string().min(1),
+  pageUrl: z.string().optional(),
+  title: z.string().optional(),
+  source: z.enum(['extension']).default('extension'),
+})
+
+const extensionCaptureStore = new Map()
 const tryonPreviewRequestSchema = z.object({
   personImageUrl: z.string().min(1),
   garmentImageUrl: z.string().min(1),
@@ -349,6 +369,12 @@ const mannequinRequestSchema = z.object({
   imageUrl: z.string().min(1),
   subjectFilter: subjectFilterSchema,
   context: mannequinContextSchema,
+})
+const cutoutRequestSchema = z.object({
+  imageUrl: z.string().min(1),
+  method: z.enum(['sam', 'gemini']).optional().default('sam'),
+  subjectFilter: subjectFilterSchema.optional(),
+  context: mannequinContextSchema.optional(),
 })
 const samRefineRequestSchema = z.object({
   imageUrl: z.string().min(1),
@@ -927,7 +953,9 @@ async function callVisionSidecarInfer(buffer) {
 }
 
 async function callVisionSidecarSamSegment(buffer, boxes = []) {
-  if (!Array.isArray(boxes) || boxes.length === 0) return []
+  if (!Array.isArray(boxes) || boxes.length === 0) {
+    return { segments: [], backend: 'none', metrics: null }
+  }
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 6000)
@@ -942,12 +970,18 @@ async function callVisionSidecarSamSegment(buffer, boxes = []) {
       signal: controller.signal,
     })
     clearTimeout(timeout)
-    if (!response.ok) return []
+    if (!response.ok) return { segments: [], backend: 'http_error', metrics: null }
     const data = await response.json()
-    if (!data?.ok || !Array.isArray(data?.segments)) return []
-    return data.segments
+    if (!data?.ok || !Array.isArray(data?.segments)) {
+      return { segments: [], backend: 'invalid_payload', metrics: null }
+    }
+    return {
+      segments: data.segments,
+      backend: typeof data.backend === 'string' ? data.backend : 'unknown',
+      metrics: data?.metrics && typeof data.metrics === 'object' ? data.metrics : null,
+    }
   } catch {
-    return []
+    return { segments: [], backend: 'request_failed', metrics: null }
   }
 }
 
@@ -996,6 +1030,21 @@ function detectSceneTrack({ faceCount, garmentCoverage }) {
   return 'ambiguous'
 }
 
+function classifyScenarioRoute({ faceCount, garmentCoverage, estimatedPersonCount }) {
+  const sceneTrack = detectSceneTrack({ faceCount, garmentCoverage })
+  const normalizedPersonCount = Math.max(0, Number(estimatedPersonCount ?? 0))
+  if (normalizedPersonCount > 1) {
+    return { scenarioRoute: 'multi_person', sceneTrack }
+  }
+  if (sceneTrack === 'flat_lay') {
+    return { scenarioRoute: 'flat_lay', sceneTrack }
+  }
+  if (sceneTrack === 'worn') {
+    return { scenarioRoute: 'single_person', sceneTrack }
+  }
+  return { scenarioRoute: 'ambiguous', sceneTrack }
+}
+
 function inferFramingFromContext(faces, occlusionVisiblePct) {
   if (faces.length > 0) return 'worn'
   if (occlusionVisiblePct < 0.55) return 'detail'
@@ -1039,6 +1088,49 @@ function prioritizeLightNeutralsPrimary(colors, fallbackToCoverage = true) {
     .sort((a, b) => (fallbackToCoverage ? Number((b.coverage_pct ?? 0) - (a.coverage_pct ?? 0)) : 0))
 
   return [primary, ...rest]
+}
+
+function isDarkNeutralHsl(hsl) {
+  if (!hsl) return false
+  return isNeutralHsl(hsl) && Number(hsl.l ?? 0) <= 0.24
+}
+
+function chromaPriorityScore(color) {
+  const hsl = color?.hsl ?? { h: 0, s: 0, l: 0 }
+  const sat = Number(hsl.s ?? 0)
+  const light = Number(hsl.l ?? 0)
+  const coverage = Number(color?.coverage_pct ?? 0)
+  const confidence = Number(color?.confidence ?? 0.6)
+  const isRedBand = Number(hsl.h ?? 0) <= 20 || Number(hsl.h ?? 0) >= 340
+  // Small bias toward saturated warm reds because they are frequently misread as black
+  // in low-light selfies where dark background pixels leak into the palette.
+  const redBoost = isRedBand && sat >= 0.22 ? 0.08 : 0
+  return sat * 0.55 + Math.max(0, light - 0.18) * 0.2 + coverage * 0.15 + confidence * 0.1 + redBoost
+}
+
+function promoteChromaticPrimaryForWorn(colors) {
+  if (!Array.isArray(colors) || colors.length < 2) return { colors, promoted: false }
+  const first = colors[0]
+  if (!isDarkNeutralHsl(first?.hsl)) return { colors, promoted: false }
+  const firstCoverage = Number(first?.coverage_pct ?? 0)
+  const candidates = colors
+    .slice(1)
+    .filter((c) => {
+      const hsl = c?.hsl
+      if (!hsl) return false
+      if (isNeutralHsl(hsl)) return false
+      const sat = Number(hsl.s ?? 0)
+      const light = Number(hsl.l ?? 0)
+      const coverage = Number(c?.coverage_pct ?? 0)
+      return sat >= 0.22 && light >= 0.2 && coverage >= 0.08
+    })
+    .sort((a, b) => chromaPriorityScore(b) - chromaPriorityScore(a))
+  const promoted = candidates[0]
+  if (!promoted) return { colors, promoted: false }
+  const promotedCoverage = Number(promoted.coverage_pct ?? 0)
+  const strongEnough = promotedCoverage >= firstCoverage * 0.42 || Number(promoted.confidence ?? 0) >= 0.84
+  if (!strongEnough) return { colors, promoted: false }
+  return { colors: [promoted, ...colors.filter((c) => c !== promoted)], promoted: true }
 }
 
 function paletteHueSpread(colors) {
@@ -2203,8 +2295,8 @@ async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidate
         applied: { ...subjectFilter, selectedPersonBboxes },
       }
     }
-    const samSegments = await callVisionSidecarSamSegment(buffer, selectedPersonBboxes)
-    const samPolygons = samSegments
+    const samRefine = await callVisionSidecarSamSegment(buffer, selectedPersonBboxes)
+    const samPolygons = samRefine.segments
       .map((seg) => (Array.isArray(seg?.polygon) ? seg.polygon : []))
       .filter((poly) => poly.length >= 3)
     const blurred = await sharp(buffer).blur(18).jpeg({ quality: 90 }).toBuffer()
@@ -2229,7 +2321,9 @@ async function applySubjectFilterToBuffer(buffer, subjectFilter, personCandidate
     }
     return {
       buffer: focused,
-      warnings: [],
+      warnings: samPolygons.length
+        ? []
+        : [`Could not isolate selected person precisely (${samRefine.backend}); used bbox fallback focus.`],
       applied: { ...subjectFilter, selectedPersonBboxes },
     }
   }
@@ -2415,7 +2509,7 @@ app.post('/api/items/detect', async (req, res) => {
       await applySubjectFilterToBuffer(privacyBuffer, subjectFilter, personCandidates, deduped)
     // Keep detection stable/fast by default; opt in explicitly for try-off-first detect.
     const enableTryoffInDetect = process.env.VESTIR_TRYOFF_FIRST === '1'
-    let sourceStage = 'blurred_fallback'
+    let sourceStage = 'original'
     let sourceBuffer = filteredBuffer
     if (enableTryoffInDetect) {
       const tryoff = await runTryoffWithBuffer(filteredBuffer, 'outfit')
@@ -2488,17 +2582,43 @@ app.post('/api/items/detect', async (req, res) => {
             y2: Number(entry.bbox.y2.toFixed(4)),
           },
           background_removed: false,
+          mask_type: 'bbox',
+          segmentation_confidence: Number(Math.max(0.35, Math.min(0.98, entry.coverage * 0.55 + entry.contrast * 0.45)).toFixed(3)),
+          requires_manual_review: entry.partiallyVisible || entry.coverage > 0.8,
+          source_stage: sourceStage,
         }))
+    } else {
+      const fallbackFilename = `${crypto.randomUUID()}.png`
+      await fs.writeFile(path.join(processedDir, fallbackFilename), sourceBuffer)
+      items = [{
+        id: crypto.randomUUID(),
+        label: 'Garment (fallback)',
+        confidence: 0.15,
+        crop_url: `/storage/processed/${fallbackFilename}`,
+        coverage: 1,
+        centrality: 1,
+        salience: 0.1,
+        is_hero: true,
+        partially_visible: false,
+        warning: 'Low-confidence fallback crop generated. Refine this item for better segmentation.',
+        bbox: { x1: 0, y1: 0, x2: 1, y2: 1 },
+        background_removed: false,
+        mask_type: 'bbox',
+        segmentation_confidence: 0.2,
+        requires_manual_review: true,
+        source_stage: sourceStage,
+      }]
     }
     const personAssignments = assignGarmentsToPersons(items.map((it, idx) => ({ ...it, bbox: sorted[idx]?.bbox })), personCandidates)
 
-    const faceCount = rawFaces.length
+    const faceCount = faceCandidates.length
     const maxCoverage = sorted[0]?.coverage ?? 0
-    const track = faceCount > 0 && maxCoverage > 0.18
-      ? 'worn'
-      : faceCount === 0 && maxCoverage > 0.14
-        ? 'flat_lay'
-        : 'ambiguous'
+    const { scenarioRoute, sceneTrack } = classifyScenarioRoute({
+      faceCount,
+      garmentCoverage: maxCoverage,
+      estimatedPersonCount,
+    })
+    const track = sceneTrack
 
     const privacyApplied = faceBlurApplied
     let autoBlurUrl = null
@@ -2513,6 +2633,9 @@ app.post('/api/items/detect', async (req, res) => {
       ...(validation.warnings ?? []),
       ...(selfieMode ? ['Selfie-mode activated: face-dominant frame, garment salience re-weighted.'] : []),
       ...(multiPerson ? ['Multiple people in frame — crops are per detected garment; verify each selection.'] : []),
+      ...(scenarioRoute === 'flat_lay'
+        ? ['Flat lay fast path active: skipped person-specific processing where possible.']
+        : []),
       ...(personAssignments.some((a) => a.requires_confirmation)
         ? ['Some garment-to-person links are low confidence. Confirm selections in the review sheet.']
         : []),
@@ -2527,6 +2650,7 @@ app.post('/api/items/detect', async (req, res) => {
       person_assignments: personAssignments,
       face_candidates: faceCandidates,
       scene_track: track,
+      scenario_route: scenarioRoute,
       source_image_url: `/storage/processed/${sourceFilename}`,
       source_image_stage: sourceStage,
       auto_blurred_image_url: autoBlurUrl,
@@ -2868,6 +2992,115 @@ async function postprocessMannequinBuffer(buffer) {
   }
 }
 
+function mannequinFileExtFromMime(mimeType) {
+  if (typeof mimeType !== 'string') return 'png'
+  if (!mimeType) return 'png'
+  if (mimeType === 'image/png') return 'png'
+  if (mimeType === 'image/jpeg') return 'jpg'
+  if (mimeType === 'image/webp') return 'webp'
+  return 'png'
+}
+
+async function generateGeminiMannequinImage(sourceBuffer) {
+  const runId = crypto.randomUUID()
+  const inputPath = path.join(processedDir, `.mannequin-input-${runId}.jpg`)
+  const outputPath = path.join(processedDir, `.mannequin-output-${runId}.png`)
+  const pythonBin = process.env.MANNEQUIN_PYTHON_BIN || mannequinVenvPythonPath || 'python3'
+  await fs.writeFile(inputPath, sourceBuffer)
+  try {
+    await execFileAsync(pythonBin, [
+      mannequinScriptPath,
+      '--input',
+      inputPath,
+      '--output',
+      outputPath,
+      '--prompt',
+      mannequinGeminiPrompt,
+      '--model',
+      mannequinGeminiModel,
+    ], {
+      env: process.env,
+      timeout: Number(process.env.MANNEQUIN_SCRIPT_TIMEOUT_MS ?? 180000),
+    })
+    const outBuffer = await fs.readFile(outputPath)
+    const outMime = (await detectImageMime(outBuffer)) || 'image/png'
+    return { outBuffer, outMime }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Mannequin script failed: ${message}`)
+  } finally {
+    await fs.unlink(inputPath).catch(() => {})
+    await fs.unlink(outputPath).catch(() => {})
+  }
+}
+
+async function generateSamCutoutImage(sourceBuffer, subjectFilter) {
+  const meta = await sharp(sourceBuffer).metadata()
+  const width = meta.width ?? 1
+  const height = meta.height ?? 1
+  const selectedBboxes = Array.isArray(subjectFilter?.selectedPersonBboxes)
+    ? subjectFilter.selectedPersonBboxes
+    : []
+  const poly = Array.isArray(subjectFilter?.maskPolygon) ? subjectFilter.maskPolygon : []
+  let keepMask = null
+  if (poly.length >= 3) {
+    keepMask = buildPolygonMaskSvg(width, height, [poly])
+  } else if (selectedBboxes.length > 0) {
+    keepMask = buildMaskSvg(width, height, selectedBboxes)
+  } else {
+    keepMask = buildMaskSvg(width, height, [{ x1: 0, y1: 0, x2: 1, y2: 1 }])
+  }
+  const outBuffer = await sharp(sourceBuffer)
+    .composite([{ input: keepMask, blend: 'dest-in' }])
+    .flatten({ background: '#ffffff' })
+    .jpeg({ quality: 92 })
+    .toBuffer()
+  return { outBuffer, outMime: 'image/jpeg' }
+}
+
+async function generateCutoutImage(sourceBuffer, method, subjectFilter) {
+  if (method === 'gemini') {
+    return generateGeminiMannequinImage(sourceBuffer)
+  }
+  return generateSamCutoutImage(sourceBuffer, subjectFilter)
+}
+
+app.post('/api/items/cutout', async (req, res) => {
+  try {
+    const body = cutoutRequestSchema.parse(req.body)
+    const started = Date.now()
+    const source = await resolveImageBuffer(body.imageUrl)
+    const { outBuffer, outMime } = await generateCutoutImage(source, body.method, body.subjectFilter)
+    const ext = mannequinFileExtFromMime(outMime)
+    const filename = `${crypto.randomUUID()}.${ext}`
+    await fs.writeFile(path.join(processedDir, filename), outBuffer)
+    return res.json({
+      cutoutImageUrl: `/storage/processed/${filename}`,
+      pipeline: {
+        version: '3.1.0',
+        architecture_id: body.method === 'gemini' ? 'gemini-image-direct' : 'sam-mask-cutout',
+        stages: [
+          {
+            id: body.method === 'gemini' ? 'gemini_image_generation' : 'sam_mask_cutout',
+            status: 'completed',
+            detail: body.method === 'gemini' ? `model=${mannequinGeminiModel}` : 'subject filter mask applied',
+          },
+        ],
+        generation_prompt: body.method === 'gemini' ? mannequinGeminiPrompt : undefined,
+        mime_type: outMime,
+        method: body.method,
+        latency_ms: Date.now() - started,
+      },
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Cutout generation failed'
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.message, code: 'VALIDATION' })
+    }
+    return res.status(400).json({ error: message })
+  }
+})
+
 app.post('/api/items/mannequin', async (req, res) => {
   try {
     const parsed = mannequinRequestSchema.safeParse(req.body)
@@ -2880,143 +3113,28 @@ app.post('/api/items/mannequin', async (req, res) => {
     }
     const body = parsed.data
     const started = Date.now()
-    const rawSource = await resolveImageBuffer(body.imageUrl)
-    const source = await preprocessSourceForMannequin(rawSource)
-    const meta = await sharp(source).metadata()
-    const width = meta.width ?? 1
-    const height = meta.height ?? 1
-    const selectedBboxes = Array.isArray(body.subjectFilter?.selectedPersonBboxes)
-      ? body.subjectFilter.selectedPersonBboxes
-      : []
-    const poly = Array.isArray(body.subjectFilter?.maskPolygon) ? body.subjectFilter.maskPolygon : []
-    const stages = []
-    stages.push({
-      id: 'ingest_preprocess',
-      status: process.env.MANNEQUIN_PREPROCESS === '0' ? 'skipped' : 'completed',
-      detail: 'normalize + mild saturation for detection-friendly contrast',
-    })
-    let keepMask = null
-    if (poly.length >= 3) {
-      keepMask = buildPolygonMaskSvg(width, height, [poly])
-    } else if (poly.length >= 1 && poly.length < 3) {
-      const thin = axisAlignedBBoxWithMinSpan(poly)
-      if (thin) keepMask = buildMaskSvg(width, height, [thin])
-    } else if (selectedBboxes.length > 0) {
-      keepMask = buildMaskSvg(width, height, selectedBboxes)
-    }
-    if (!keepMask) {
-      return res.status(400).json({
-        error:
-          'Select a region/person before mannequin generation. Send subjectFilter.maskPolygon (1+ points) and/or selectedPersonBboxes.',
-        code: 'MANNEQUIN_NO_REGION',
-        received: {
-          hasSubjectFilter: Boolean(body.subjectFilter),
-          maskPointCount: poly.length,
-          bboxCount: selectedBboxes.length,
-        },
-      })
-    }
-    stages.push({
-      id: 'human_garment_region',
-      status: 'completed',
-      detail: poly.length >= 3 ? 'SAM-style polygon mask' : 'axis-aligned subject region',
-    })
-    const isolated = await sharp(source).composite([{ input: keepMask, blend: 'dest-in' }]).png().toBuffer()
-    const cutoutRgb = await sharp({
-      create: {
-        width,
-        height,
-        channels: 3,
-        background: '#ffffff',
-      },
-    })
-      .composite([{ input: isolated, blend: 'over' }])
-      .jpeg({ quality: 92 })
-      .toBuffer()
-
-    const ctx = body.context ?? {}
-    const labels = ctx.selectedLabels ?? []
-    const hints = ctx.attributeHints ?? {}
-    const rgb = await averageRgbFromImageBuffer(isolated)
-    const colorName = rgbToApproxColorName(rgb.r, rgb.g, rgb.b)
-    const catalogAttributes = buildMannequinCatalogAttributes(labels, hints, rgb, colorName)
-    const generationPrompt = buildMannequinGenerationPrompt(catalogAttributes)
-    stages.push({
-      id: 'semantic_attribute_encoding',
-      status: 'completed',
-      detail: 'structured catalog fields + dominant color sample from masked crop',
-    })
-    stages.push({
-      id: 'prompt_construction',
-      status: 'completed',
-      detail: 'internal studio prompt for optional diffusion refine',
-    })
-
-    let outBuffer = cutoutRgb
-    let diffusionRefined = false
-    const useTryoff = process.env.MANNEQUIN_USE_TRYOFF?.trim() === '1'
-    const garmentTarget = ctx.garmentTarget ?? garmentTargetFromMannequinLabels(labels)
-    if (useTryoff) {
-      stages.push({
-        id: 'generative_reconstruction',
-        status: 'partial',
-        detail: 'calling try-on sidecar /tryoff with attribute-aware prompt',
-      })
-      const mannequinTryoffTimeoutMs = Number(process.env.MANNEQUIN_TRYOFF_TIMEOUT_MS ?? '90000')
-      const tryoff = await runTryoffWithBuffer(cutoutRgb, garmentTarget, undefined, {
-        promptOverride: generationPrompt,
-        timeoutMs: Number.isFinite(mannequinTryoffTimeoutMs) && mannequinTryoffTimeoutMs >= 0
-          ? mannequinTryoffTimeoutMs
-          : 90000,
-      })
-      if (tryoff.implemented && tryoff.resultBuffer) {
-        outBuffer = tryoff.resultBuffer
-        diffusionRefined = true
-        stages[stages.length - 1] = {
-          id: 'generative_reconstruction',
-          status: 'completed',
-          detail: 'diffusion refine (TRYOFF) applied on white-background cutout',
-        }
-      } else {
-        stages[stages.length - 1] = {
-          id: 'generative_reconstruction',
-          status: 'skipped',
-          detail: String(tryoff.message ?? 'tryoff unavailable — sharp cutout retained'),
-        }
-      }
-    } else {
-      stages.push({
-        id: 'generative_reconstruction',
-        status: 'skipped',
-        detail: 'MANNEQUIN_USE_TRYOFF not set to 1 — pixel-accurate masked composite only',
-      })
-    }
-
-    stages.push({
-      id: 'mannequin_composition',
-      status: 'completed',
-      detail: 'neutral white field, identity removed outside mask, standard front-facing crop',
-    })
-
-    const mannequin = await postprocessMannequinBuffer(outBuffer)
-    stages.push({
-      id: 'post_processing',
-      status: process.env.MANNEQUIN_POSTPROCESS === '0' ? 'skipped' : 'completed',
-      detail: 'sharpen + JPEG encode (background already #FFFFFF)',
-    })
-
-    const filename = `${crypto.randomUUID()}.jpg`
-    await fs.writeFile(path.join(processedDir, filename), mannequin)
+    const source = await resolveImageBuffer(body.imageUrl)
+    const method = (req.body?.method === 'sam' || req.body?.method === 'gemini') ? req.body.method : 'gemini'
+    const { outBuffer, outMime } = await generateCutoutImage(source, method, body.subjectFilter)
+    const ext = mannequinFileExtFromMime(outMime)
+    const filename = `${crypto.randomUUID()}.${ext}`
+    await fs.writeFile(path.join(processedDir, filename), outBuffer)
     return res.json({
       mannequinImageUrl: `/storage/processed/${filename}`,
+      cutoutImageUrl: `/storage/processed/${filename}`,
       pipeline: {
-        version: '2.0.0',
-        architecture_id: PIPELINE_ARCHITECTURE_ID,
-        stages,
-        catalog_attributes: catalogAttributes,
-        generation_prompt: generationPrompt,
-        diffusion_refined: diffusionRefined,
-        garment_target: garmentTarget,
+        version: '3.1.0',
+        architecture_id: method === 'gemini' ? 'gemini-image-direct' : 'sam-mask-cutout',
+        stages: [
+          {
+            id: method === 'gemini' ? 'gemini_image_generation' : 'sam_mask_cutout',
+            status: 'completed',
+            detail: method === 'gemini' ? `model=${mannequinGeminiModel}` : 'subject filter mask applied',
+          },
+        ],
+        generation_prompt: method === 'gemini' ? mannequinGeminiPrompt : undefined,
+        mime_type: outMime,
+        method,
         latency_ms: Date.now() - started,
       },
     })
@@ -3044,119 +3162,34 @@ const mannequinV2RequestSchema = z.object({
   allowLegacyFallback: z.boolean().optional(),
 })
 
-async function callLegacyMannequinFallback(imageUrl, reason) {
-  const response = await fetch(`http://127.0.0.1:${process.env.PORT || 8787}/api/items/mannequin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ imageUrl, fallbackReason: reason }),
-  })
-  if (!response.ok) {
-    const text = await response.text()
-    throw new Error(`legacy_fallback_http_${response.status}: ${text.slice(0, 400)}`)
-  }
-  return response.json()
-}
-
 app.post('/api/items/mannequin-v2', async (req, res) => {
   const started = Date.now()
   try {
     const body = mannequinV2RequestSchema.parse(req.body)
-    const allowFallback = body.allowLegacyFallback ?? true
     const buffer = await resolveImageBuffer(body.imageUrl)
-    const timeoutMs = Number(process.env.MANNEQUIN_V2_TIMEOUT_MS ?? '180000')
-    const controller = new AbortController()
-    const timeoutId = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null
-    let sidecarJson
-    try {
-      const response = await fetch(`${tryonSidecarUrl}/mannequin_v2`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image_base64: buffer.toString('base64'),
-          seed: body.seed,
-          score_threshold: body.scoreThreshold,
-          num_candidates: body.numCandidates,
-          use_cache: body.useCache ?? true,
-          variant: body.variant ?? 'v2.1-textonly',
-        }),
-        signal: controller.signal,
-      })
-      if (!response.ok) {
-        const text = await response.text()
-        throw new Error(`sidecar_http_${response.status}: ${text.slice(0, 400)}`)
-      }
-      sidecarJson = await response.json()
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId)
-    }
-
-    console.info('[mannequin-v2] pipeline stages=%s conf=%s score=%s fallback=%s',
-      JSON.stringify(sidecarJson?.stages?.map?.((s) => [s.id, s.status, s.duration_ms]) ?? []),
-      sidecarJson?.attribute_confidence,
-      sidecarJson?.score,
-      sidecarJson?.fallback_recommended,
-    )
-
-    // Transparent fallback to legacy SAM pipeline when generative path bailed.
-    if (sidecarJson?.fallback_recommended && allowFallback) {
-      try {
-        const legacy = await callLegacyMannequinFallback(
-          body.imageUrl, sidecarJson.fallback_reason || 'v2_fallback',
-        )
-        return res.json({
-          mannequinImageUrl: legacy.mannequinImageUrl,
-          pipeline: {
-            version: 'v2.0.0-generative + legacy_fallback',
-            architecture_id: 'caption-normalize-prompt-sdxl-score-post',
-            used_path: 'legacy_sam_fallback',
-            fallback_reason: sidecarJson.fallback_reason,
-            attribute_confidence: sidecarJson.attribute_confidence,
-            attributes: sidecarJson.attributes,
-            notes: sidecarJson.notes,
-            stages: sidecarJson.stages,
-            legacy_pipeline: legacy.pipeline,
-            latency_ms: Date.now() - started,
-          },
-        })
-      } catch (fallbackErr) {
-        console.warn('[mannequin-v2] legacy fallback failed:', fallbackErr)
-        return res.status(502).json({
-          error: 'both_pipelines_failed',
-          fallback_error: String(fallbackErr),
-          pipeline: sidecarJson,
-        })
-      }
-    }
-
-    if (!sidecarJson?.has_image || !sidecarJson?.result_image_base64) {
-      return res.status(502).json({
-        error: sidecarJson?.fallback_reason || 'mannequin_v2_failed',
-        pipeline: sidecarJson,
-      })
-    }
-
-    const outBuffer = Buffer.from(sidecarJson.result_image_base64, 'base64')
-    const filename = `${crypto.randomUUID()}.jpg`
+    const { outBuffer, outMime } = await generateGeminiMannequinImage(buffer)
+    const ext = mannequinFileExtFromMime(outMime)
+    const filename = `${crypto.randomUUID()}.${ext}`
     await fs.writeFile(path.join(processedDir, filename), outBuffer)
 
     return res.json({
       mannequinImageUrl: `/storage/processed/${filename}`,
       pipeline: {
-        version: 'v2.0.0-generative',
-        architecture_id: 'caption-normalize-prompt-sdxl-score-post',
-        used_path: 'text_to_image',
-        total_ms: sidecarJson.total_ms,
+        version: '3.0.0',
+        architecture_id: 'gemini-image-direct',
+        used_path: 'gemini_image_generation',
         latency_ms: Date.now() - started,
-        cache_hit: sidecarJson.cache_hit,
-        score: sidecarJson.score,
-        attribute_confidence: sidecarJson.attribute_confidence,
-        attributes: sidecarJson.attributes,
-        prompt: sidecarJson.prompt,
-        negative_prompt: sidecarJson.negative_prompt,
-        candidates: sidecarJson.candidates,
-        selected_index: sidecarJson.selected_index,
-        stages: sidecarJson.stages,
-        notes: sidecarJson.notes,
+        model: mannequinGeminiModel,
+        prompt: mannequinGeminiPrompt,
+        mime_type: outMime,
+        requested: {
+          seed: body.seed,
+          scoreThreshold: body.scoreThreshold,
+          numCandidates: body.numCandidates,
+          useCache: body.useCache,
+          variant: body.variant,
+          allowLegacyFallback: body.allowLegacyFallback,
+        },
       },
     })
   } catch (error) {
@@ -3172,9 +3205,12 @@ app.post('/api/items/sam/refine', async (req, res) => {
   try {
     const body = samRefineRequestSchema.parse(req.body)
     const buffer = await resolveImageBuffer(body.imageUrl)
-    const segments = await callVisionSidecarSamSegment(buffer, body.boxes)
+    const samRefine = await callVisionSidecarSamSegment(buffer, body.boxes)
+    const segments = samRefine.segments
     return res.json({
       ok: true,
+      backend: samRefine.backend,
+      metrics: samRefine.metrics,
       polygons: segments
         .map((seg) => (Array.isArray(seg?.polygon) ? seg.polygon : []))
         .filter((poly) => poly.length >= 3),
@@ -3380,6 +3416,8 @@ app.post('/api/items/preprocess', async (req, res) => {
         personDetected: false,
         garmentIsolated: true,
         scene_track: 'flat_lay',
+        scenario_route: 'flat_lay',
+        source_image_stage: 'preprocess',
         scene: { face_count: 0, garment_coverage: 1 },
         validation: {},
         warnings: [],
@@ -3423,6 +3461,8 @@ app.post('/api/items/preprocess', async (req, res) => {
         personDetected: false,
         garmentIsolated: true,
         scene_track: 'flat_lay',
+        scenario_route: 'flat_lay',
+        source_image_stage: 'preprocess',
         scene: { face_count: 0, garment_coverage: 1 },
         validation: validation.metrics,
         warnings: ['maskPolygon crop — downstream color uses alpha-aware stats.'],
@@ -3465,9 +3505,17 @@ app.post('/api/items/preprocess', async (req, res) => {
       : await detectGarmentRegions(buffer)
     const primaryRegion = garmentRegions[0]
     const garmentCoverage = primaryRegion ? normalizedRegionCoverage(primaryRegion.vertices) : 0
-    const detectedTrack = detectSceneTrack({ faceCount: rawFaces.length, garmentCoverage })
-    const track = detectedTrack === 'ambiguous' ? (rawFaces.length > 0 ? 'worn' : 'flat_lay') : detectedTrack
-    const sceneWarning = detectedTrack === 'ambiguous'
+    const estimatedPersonCount = Math.max(rawFaces.length, Number(sidecar?.person_count ?? 0))
+    const classified = classifyScenarioRoute({
+      faceCount: rawFaces.length,
+      garmentCoverage,
+      estimatedPersonCount,
+    })
+    const track = classified.sceneTrack === 'ambiguous' ? (rawFaces.length > 0 ? 'worn' : 'flat_lay') : classified.sceneTrack
+    const scenarioRoute = classified.sceneTrack === 'ambiguous'
+      ? (rawFaces.length > 0 ? 'single_person' : 'flat_lay')
+      : classified.scenarioRoute
+    const sceneWarning = classified.sceneTrack === 'ambiguous'
       ? 'Scene was ambiguous; fallback track selected automatically.'
       : undefined
 
@@ -3513,6 +3561,8 @@ app.post('/api/items/preprocess', async (req, res) => {
       garmentIsolated: Boolean(garmentRegion),
       backgroundRemoved: shouldRemoveBackground,
       scene_track: track,
+      scenario_route: scenarioRoute,
+      source_image_stage: 'preprocess',
       scene: {
         face_count: rawFaces.length,
         garment_coverage: Number(garmentCoverage.toFixed(3)),
@@ -3873,9 +3923,13 @@ Schema:
         }
       }
       const shouldPreferLightNeutrals = quality.framing !== 'worn' && sourceImageStage !== 'tryoff'
+      const wornColorAdjusted = quality.framing === 'worn'
+        ? promoteChromaticPrimaryForWorn(colorsBase)
+        : { colors: colorsBase, promoted: false }
+      const colorsCandidateBase = wornColorAdjusted.colors
       const colors = shouldPreferLightNeutrals
-        ? prioritizeLightNeutralsPrimary(colorsBase)
-        : colorsBase
+        ? prioritizeLightNeutralsPrimary(colorsCandidateBase)
+        : colorsCandidateBase
 
       const seasonEntries = Object.entries(semantic.seasons)
       const season = seasonEntries
@@ -3915,6 +3969,9 @@ Schema:
       if (contradictions.length) uncertainFields.push(...contradictions)
       if (coerced.adjusted) uncertainFields.push('garment_identity')
       if (wornPrefersVision && colorMismatch) uncertainFields.push('color_primary_photo_weighted')
+      if (wornColorAdjusted.promoted) {
+        uncertainFields.push('color_dark_contamination_adjusted')
+      }
       const adjustedConfidenceOverall = Number(
         (confidenceOverall * (1 - Math.min(0.2, filterSignature.risk * 0.25))).toFixed(3),
       )
@@ -4739,6 +4796,46 @@ app.post('/api/extension/match', async (req, res) => {
       code: 'EXTENSION_MATCH_FAILED',
     })
   }
+})
+
+app.post('/api/extension/capture', async (req, res) => {
+  try {
+    const body = extensionCaptureSchema.parse(req.body)
+    const token = crypto.randomUUID()
+    const expiresAt = Date.now() + 1000 * 60 * 30
+    extensionCaptureStore.set(token, { ...body, createdAt: Date.now(), expiresAt })
+    res.json({
+      token,
+      importUrl: `/import-capture/${token}`,
+      expiresAt,
+    })
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : 'Extension capture failed',
+      code: 'EXTENSION_CAPTURE_FAILED',
+    })
+  }
+})
+
+app.get('/api/extension/capture/:token', async (req, res) => {
+  const token = String(req.params.token ?? '')
+  const payload = extensionCaptureStore.get(token)
+  if (!payload) {
+    return res.status(404).json({ error: 'Capture token not found', code: 'EXTENSION_CAPTURE_NOT_FOUND' })
+  }
+  if (Date.now() > Number(payload.expiresAt ?? 0)) {
+    extensionCaptureStore.delete(token)
+    return res.status(410).json({ error: 'Capture token expired', code: 'EXTENSION_CAPTURE_EXPIRED' })
+  }
+  return res.json({
+    token,
+    imageUrl: payload.imageUrl,
+    pageUrl: payload.pageUrl ?? null,
+    title: payload.title ?? null,
+    source: payload.source ?? 'extension',
+    createdAt: payload.createdAt,
+    expiresAt: payload.expiresAt,
+  })
 })
 
 app.post('/api/items/reason', async (req, res) => {

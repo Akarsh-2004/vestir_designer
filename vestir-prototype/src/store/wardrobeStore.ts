@@ -3,12 +3,14 @@ import { mockItems, mockOutfits, mockWardrobes } from '../data/mock'
 import type {
   ActiveView,
   BlurQualityPreset,
+  BrandSizeEntry,
   Category,
   DetectedGarment,
   DetectionResult,
   Item,
   NormalizedBBox,
   Outfit,
+  SizePassport,
   SubjectFilterMode,
   Wardrobe,
 } from '../types/index'
@@ -28,6 +30,7 @@ import {
 } from '../lib/pipeline/adapters'
 import { processItemPipeline } from '../lib/pipeline/orchestrator'
 import type { PostPipelineSuggestionResult, StyleProfile, WeatherContext } from '../lib/pipeline/contracts'
+import { inferCategoryFromText } from '../lib/categoryInference'
 
 interface WardrobeStore {
   wardrobes: Wardrobe[]
@@ -37,6 +40,7 @@ interface WardrobeStore {
   activeView: ActiveView
   activeCategory: Category | 'All'
   searchQuery: string
+  sizePassport: SizePassport
   pendingDetection: DetectionResult | null
   pendingDetectionImageUrl: string | null
   pendingDetectionSelections: Set<string>
@@ -53,12 +57,17 @@ interface WardrobeStore {
   setActiveCategory: (cat: Category | 'All') => void
   setActiveView: (view: ActiveView) => void
   setSearchQuery: (query: string) => void
+  updateSizePassport: (updates: Partial<SizePassport>) => void
+  addBrandSize: (entry: Omit<BrandSizeEntry, 'id'>) => void
+  updateBrandSize: (id: string, updates: Partial<BrandSizeEntry>) => void
+  removeBrandSize: (id: string) => void
   addWardrobe: (name: string) => void
   deleteWardrobe: (id: string) => void
   updateItem: (id: string, updates: Partial<Item>) => void
   deleteItem: (id: string) => void
   addOutfit: (outfit: Outfit) => void
   detectItemsFromFile: (file: File) => Promise<void>
+  detectItemsFromImageUrl: (imageUrl: string) => Promise<void>
   toggleDetectionSelection: (id: string) => void
   setSubjectFilterMode: (mode: SubjectFilterMode) => void
   setBlurQualityPreset: (preset: BlurQualityPreset) => void
@@ -210,6 +219,15 @@ function restoreSnapshot(snapshot: EditorSnapshot) {
   }
 }
 
+const DEFAULT_SIZE_PASSPORT: SizePassport = {
+  preferred_region: 'US',
+  top_size: '',
+  bottom_size: '',
+  fit_preference: 'Regular',
+  preferred_silhouettes: [],
+  brand_sizes: [],
+}
+
 export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   wardrobes: mockWardrobes,
   activeWardrobeId: mockWardrobes[0]?.id ?? '',
@@ -218,6 +236,7 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   activeView: 'items',
   activeCategory: 'All',
   searchQuery: '',
+  sizePassport: DEFAULT_SIZE_PASSPORT,
   pendingDetection: null,
   pendingDetectionImageUrl: null,
   pendingDetectionSelections: new Set<string>(),
@@ -238,6 +257,38 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
   setActiveCategory: (cat) => set({ activeCategory: cat }),
   setActiveView: (view) => set({ activeView: view }),
   setSearchQuery: (query) => set({ searchQuery: query }),
+
+  updateSizePassport: (updates) =>
+    set((state) => ({ sizePassport: { ...state.sizePassport, ...updates } })),
+
+  addBrandSize: (entry) =>
+    set((state) => ({
+      sizePassport: {
+        ...state.sizePassport,
+        brand_sizes: [
+          ...state.sizePassport.brand_sizes,
+          { ...entry, id: crypto.randomUUID() },
+        ],
+      },
+    })),
+
+  updateBrandSize: (id, updates) =>
+    set((state) => ({
+      sizePassport: {
+        ...state.sizePassport,
+        brand_sizes: state.sizePassport.brand_sizes.map((e) =>
+          e.id === id ? { ...e, ...updates } : e,
+        ),
+      },
+    })),
+
+  removeBrandSize: (id) =>
+    set((state) => ({
+      sizePassport: {
+        ...state.sizePassport,
+        brand_sizes: state.sizePassport.brand_sizes.filter((e) => e.id !== id),
+      },
+    })),
 
   addWardrobe: (name) =>
     set((state) => {
@@ -263,9 +314,26 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
 
   updateItem: (id, updates) =>
     set((state) => ({
-      items: state.items.map((item) =>
-        item.id === id ? { ...item, ...updates, updated_at: new Date().toISOString() } : item,
-      ),
+      items: state.items.map((item) => {
+        if (item.id !== id) return item
+        const merged = { ...item, ...updates, updated_at: new Date().toISOString() }
+        // Reconcile category from item_type when the patch updates item_type but
+        // does not explicitly set category, OR when the patch sets a category
+        // that disagrees with a strong text signal from item_type.
+        // This is the safety net for the "trousers labeled as Tops" class of bugs.
+        const nextItemType = merged.item_type
+        const inferred = inferCategoryFromText(nextItemType)
+        if (inferred && inferred !== merged.category) {
+          const userExplicitlySetCategory =
+            'category' in updates &&
+            updates.category != null &&
+            (!('item_type' in updates) || updates.item_type === item.item_type)
+          if (!userExplicitlySetCategory) {
+            merged.category = inferred
+          }
+        }
+        return merged
+      }),
     })),
 
   deleteItem: (id) =>
@@ -297,6 +365,26 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
     const heroSelections = buildDefaultDetectionSelection(result.detected)
     const defaultPeople = new Set((result.person_candidates ?? []).map((p) => p.id))
     const previewUrl = processedPreviewUrlFromDetection(result, detectSourceUrl)
+    set({
+      pendingDetectionImageUrl: previewUrl,
+      pendingDetection: result,
+      pendingDetectionSelections: heroSelections,
+      subjectFilterMode: result.applied_subject_filter?.mode ?? 'keep_selected_person',
+      subjectFilterPersonSelections: defaultPeople,
+      subjectFilterMaskPolygon: result.applied_subject_filter?.maskPolygon ?? [],
+      editorHistoryPast: [],
+      editorHistoryFuture: [],
+    })
+  },
+
+  detectItemsFromImageUrl: async (imageUrl) => {
+    const result = await detectItemsFromImage(imageUrl, {
+      mode: 'keep_selected_person',
+      aiAssist: true,
+    })
+    const heroSelections = buildDefaultDetectionSelection(result.detected)
+    const defaultPeople = new Set((result.person_candidates ?? []).map((p) => p.id))
+    const previewUrl = processedPreviewUrlFromDetection(result, imageUrl)
     set({
       pendingDetectionImageUrl: previewUrl,
       pendingDetection: result,
@@ -749,7 +837,7 @@ export const useWardrobeStore = create<WardrobeStore>((set, get) => ({
         mode: 'keep_selected_person',
         aiAssist: true,
       })
-    } catch (e1) {
+    } catch {
       try {
         detected = await detectItemsFromImage(tryoffUrl, {
           mode: 'keep_selected_person',

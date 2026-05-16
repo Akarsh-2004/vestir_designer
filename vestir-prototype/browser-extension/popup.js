@@ -1,5 +1,6 @@
 const apiInput = document.getElementById('apiBase')
 const matchBtn = document.getElementById('matchBtn')
+const addBtn = document.getElementById('addBtn')
 const statusEl = document.getElementById('status')
 const matchesEl = document.getElementById('matches')
 const queryCardEl = document.getElementById('queryCard')
@@ -101,10 +102,42 @@ async function runMatch() {
   }
 }
 
+async function addToVestir() {
+  try {
+    setStatus('Reading product from current page...')
+    const tab = await getActiveTab()
+    if (!tab?.id) throw new Error('No active tab found')
+    const extraction = await chrome.tabs.sendMessage(tab.id, { type: 'VESTIR_EXTRACT_PRODUCT' })
+    if (!extraction?.imageUrl) {
+      throw new Error('Could not find a clothing image on this page.')
+    }
+    const apiBase = (apiInput.value || 'http://127.0.0.1:8787').replace(/\/$/, '')
+    await chrome.storage.local.set({ vestirApiBase: apiBase })
+    setStatus('Creating handoff token...')
+    const response = await fetch(`${apiBase}/api/extension/capture`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageUrl: extraction.imageUrl,
+        pageUrl: extraction.pageUrl,
+        title: extraction.title,
+      }),
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error ?? 'Capture request failed')
+    const appUrl = `${apiBase}/import-capture/${data.token}`
+    await chrome.tabs.create({ url: appUrl })
+    setStatus('Opened Vestir import flow.')
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Unexpected error', true)
+  }
+}
+
 async function init() {
   const saved = await chrome.storage.local.get(['vestirApiBase'])
   apiInput.value = saved.vestirApiBase || 'http://127.0.0.1:8787'
   matchBtn.addEventListener('click', runMatch)
+  addBtn.addEventListener('click', addToVestir)
 }
 
 init()

@@ -22,7 +22,15 @@ function ItemCard({ item }: { item: Item }) {
 
   return (
     <div className="item-card" style={{ position: 'relative' }}>
-      <Link to={`/item/${item.id}`} className="item-card__link" aria-label={item.item_type}>
+      <Link
+        to={`/item/${item.id}`}
+        className="item-card__link"
+        aria-label={
+          isProcessing
+            ? `${item.item_type}, analysing`
+            : `${item.item_type}, ${item.color_primary || 'colour unknown'}`
+        }
+      >
         <div className="item-card__photo" style={{ background: bgColor }}>
           {item.image_url ? (
             <img src={item.image_url} alt={item.item_type} className="item-card__img" />
@@ -95,7 +103,7 @@ export function ItemsGrid({ onAddItems }: ItemsGridProps) {
 
   if (!items.length) {
     return (
-      <div className="empty-state">
+      <div className="empty-state" role="status" aria-live="polite">
         <div className="empty-state__icon">
           <Shirt size={28} />
         </div>

@@ -1,5 +1,71 @@
 export type Category = 'Tops' | 'Bottoms' | 'Outerwear' | 'Shoes' | 'Accessories'
 
+export type FitPreference = 'Relaxed' | 'Regular' | 'Slim'
+export type SizeRegion = 'US' | 'UK' | 'EU' | 'IT' | 'FR' | 'JP' | 'AU'
+export type BrandSizeCategory =
+  | 'Tops'
+  | 'Dresses'
+  | 'Bottoms'
+  | 'Jeans'
+  | 'Outerwear'
+  | 'Shoes'
+  | 'Activewear'
+  | 'Lingerie'
+  | 'Swimwear'
+  | 'Accessories'
+
+export interface BrandSizeEntry {
+  id: string
+  brand: string
+  category: BrandSizeCategory
+  size: string
+  fit_note?: string
+  runs?: 'small' | 'true' | 'large'
+}
+
+export interface SizePassport {
+  preferred_region: SizeRegion
+  top_size: string
+  bottom_size: string
+  dress_size?: string
+  outerwear_size?: string
+  jeans_waist_in?: string
+  jeans_inseam_in?: string
+  shoe_size_us?: string
+  shoe_size_uk?: string
+  shoe_size_eu?: string
+  shoe_size_cm?: string
+  shoe_width?: 'Narrow' | 'Standard' | 'Wide' | 'Extra Wide'
+  bra_band?: string
+  bra_cup?: string
+  bra_region?: 'US' | 'UK' | 'EU' | 'AU'
+  underwear_size?: string
+  ring_size?: string
+  hat_size?: string
+  glove_size?: string
+  belt_size?: string
+  sock_size?: string
+  height_cm?: string
+  weight_kg?: string
+  chest_cm?: string
+  bust_cm?: string
+  underbust_cm?: string
+  waist_cm?: string
+  hip_cm?: string
+  thigh_cm?: string
+  inseam_cm?: string
+  outseam_cm?: string
+  shoulder_cm?: string
+  sleeve_cm?: string
+  neck_cm?: string
+  foot_length_cm?: string
+  foot_width_cm?: string
+  fit_preference: FitPreference
+  preferred_silhouettes: string[]
+  brand_sizes: BrandSizeEntry[]
+  notes?: string
+}
+
 export const FIT_LABELS = ['Slim', 'Regular', 'Relaxed', 'Oversized', 'Cropped', 'Tailored'] as const
 export type FitLabel = (typeof FIT_LABELS)[number]
 
@@ -86,6 +152,14 @@ export interface DetectedGarment {
   bbox?: NormalizedBBox
   /** True when crop_url has a transparent background (alpha PNG via SAM/mask). */
   background_removed?: boolean
+  /** Extraction method used by backend for this crop. */
+  mask_type?: 'sam' | 'polygon' | 'grabcut' | 'bbox'
+  /** 0-1 confidence score for segmentation quality. */
+  segmentation_confidence?: number
+  /** Soft fallback: item is usable but should be reviewed/refined. */
+  requires_manual_review?: boolean
+  /** High-level extraction route used by backend. */
+  source_stage?: 'original' | 'tryoff' | 'mannequin' | 'preprocess'
 }
 
 export interface NormalizedPoint {
@@ -144,7 +218,7 @@ export interface DetectionResult {
   face_candidates?: FaceCandidate[]
   scene_track: 'worn' | 'flat_lay' | 'ambiguous'
   source_image_url: string
-  source_image_stage?: 'tryoff' | 'blurred_fallback'
+  source_image_stage?: 'original' | 'tryoff' | 'blurred_fallback' | 'mannequin' | 'preprocess'
   auto_blurred_image_url?: string | null
   manual_blur_required?: boolean
   applied_subject_filter?: SubjectFilterConfig
@@ -156,6 +230,8 @@ export interface DetectionResult {
     multi_person?: boolean
   }
   warnings?: string[]
+  /** Server scenario router output used for path-specific UX. */
+  scenario_route?: 'flat_lay' | 'single_person' | 'multi_person' | 'ambiguous'
 }
 
 export type ActiveView = 'items' | 'outfits'

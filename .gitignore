@@ -1,54 +1,185 @@
-# Dependencies & builds
-node_modules/
-dist/
-dist-ssr/
-*.local
-__pycache__/
-*.py[cod]
-*$py.class
-.Python
-*.egg-info/
-.eggs/
-
-# Envs & secrets
-.env
-.env.*
-!.env.example
-.venv/
-venv/
-ENV/
-
-# ML / large artifacts (keep training outputs local)
-vestir-prototype/tryon-sidecar/models/
-vestir-prototype/tryon-sidecar/outputs/
-*.pt
-*.pth
-*.onnx
-*.weights
-runs/
-df2_yolov8_dataset/
-wandb/
-
-# Logs
-logs/
-*.log
-npm-debug.log*
-
-# OS / IDE
+# =========================
+# OS / Editor
+# =========================
 .DS_Store
 Thumbs.db
+.vscode/
 .idea/
-.vscode/*
-!.vscode/extensions.json
 
-# App runtime data (regenerate locally)
-vestir-prototype/server/storage/processed/**
-!vestir-prototype/server/storage/processed/.gitkeep
-vestir-prototype/server/storage/embeddings.json
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
 
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
 # Jupyter
+# =========================
 .ipynb_checkpoints/
 
-# Misc
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+wandb/
+mlruns/
+tensorboard/
+runs/
+
+# =========================
+# Model Weights / Checkpoints
+# =========================
+checkpoints/
+weights/
+models/
+pretrained/
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.weights
+*.tflite
+*.pb
+
+# =========================
+# Datasets / Data
+# =========================
+data/
+datasets/
+dataset/
+coco/
+images/
+annotations/
+downloads/
+backup/
+
+# CSV / parquet / data files anywhere
+**/*.csv
+**/*.tsv
+**/*.jsonl
+**/*.parquet
+**/*.feather
+**/*.h5
+**/*.hdf5
+**/*.pkl
+**/*.pickle
+**/*.joblib
+
+# =========================
+# Images / Videos anywhere
+# =========================
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.bmp
+**/*.tiff
+**/*.webp
+**/*.svg
+
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.mkv
+**/*.webm
+
+# =========================
+# Audio files
+# =========================
+**/*.mp3
+**/*.wav
+**/*.flac
+**/*.aac
+
+# =========================
+# Large archives
+# =========================
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.7z
+*.rar
+
+# =========================
+# Outputs / Predictions
+# =========================
+output/
+outputs/
+results/
+predictions/
+experiments/
+tmp/
+temp/
+cache/
+
+# =========================
+# Ollama
+# =========================
+ollama/
+.modelfiles/
+
+# =========================
+# SAM / Vision cache
+# =========================
+*.npy
+*.npz
+
+# =========================
+# Secrets / Env
+# =========================
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+credentials.json
+
+# =========================
+# Temp
+# =========================
 *.swp
-*.suo
+*.swo
+
+
+DeepFashion2/
+df2_yolov8_dataset/
+fitted_prototype/
+vestir_aistudio/
+
+**/*.csv
+**/*.json
+**/*.jsonl
+**/*.parquet
+
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.webp
+
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.safetensors
+
+.mpl-cache/
